@@ -1,0 +1,3 @@
+number,value,datetime_start,datetime_complete,duration,params_bagging_temperature,params_depth,params_l2_leaf_reg,params_learning_rate,params_random_strength,params_variant,system_attrs_fixed_params,state
+0,,2026-09-09 19:03:14.718461,2026-09-09 19:13:57.822927,0 days 00:10:43.104466,1.0,6.0,8.0,0.04,1.0,raw,"{'variant': 'raw', 'depth': 6, 'learning_rate': 0.04, 'l2_leaf_reg': 8.0, 'random_strength': 1.0, 'bagging_temperature': 1.0}",FAIL
+1,,,,,,,,,,,"{'variant': 'interaction', 'depth': 6, 'learning_rate': 0.04, 'l2_leaf_reg': 8.0, 'random_strength': 1.0, 'bagging_temperature': 1.0}",WAITING

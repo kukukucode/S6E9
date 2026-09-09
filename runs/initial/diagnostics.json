@@ -1,0 +1,26 @@
+{
+  "adversarial_auc": 0.4930258148148148,
+  "id_excluded": true,
+  "sealed_excluded": true,
+  "train_rows": 668665,
+  "test_rows": 286571,
+  "features": [
+    "Age",
+    "Annual_Income_USD",
+    "Daily_Commute_km",
+    "Number_of_Cars_Owned",
+    "Charging_Stations_Near_Home",
+    "Charging_Stations_Near_Work",
+    "Environmental_Concern_Level",
+    "Gender",
+    "City_Type",
+    "Current_Car_Type",
+    "Home_Charging_Possible",
+    "Subsidy_Available",
+    "Range_Anxiety_Level"
+  ],
+  "development_positive_rate": 0.17464462772838416,
+  "development_duplicate_feature_rows": 0,
+  "test_duplicate_feature_rows": 0,
+  "note": "AV near 0.5 means this classifier found little shift; it does not prove identical distributions."
+}

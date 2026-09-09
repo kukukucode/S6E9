@@ -1,0 +1,17 @@
+{
+  "status": "passed",
+  "submission_rows": 286571,
+  "columns": [
+    "id",
+    "Will_Buy_EV"
+  ],
+  "id_order_matches_template": true,
+  "all_probabilities_valid": true,
+  "weighted_prediction_max_error": 1.1102230246251565e-16,
+  "final_oof_auc": 0.9419875782784184,
+  "source_and_config_hashes_match": true,
+  "notebook_source_matches": true,
+  "prediction_min": 4.155150384631234e-05,
+  "prediction_max": 0.9672662232171328,
+  "prediction_mean": 0.17464759370309524
+}

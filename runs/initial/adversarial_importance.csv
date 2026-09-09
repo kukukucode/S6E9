@@ -1,0 +1,14 @@
+feature,importance
+Annual_Income_USD,1873
+Daily_Commute_km,1812
+Age,1300
+Charging_Stations_Near_Work,1015
+Charging_Stations_Near_Home,776
+Environmental_Concern_Level,511
+Current_Car_Type,307
+Number_of_Cars_Owned,285
+Gender,216
+City_Type,195
+Subsidy_Available,189
+Home_Charging_Possible,114
+Range_Anxiety_Level,82

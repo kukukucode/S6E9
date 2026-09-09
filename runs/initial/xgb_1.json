@@ -1,0 +1,29 @@
+{
+  "family": "xgb",
+  "variant": "interaction",
+  "params": {
+    "max_depth": 5,
+    "min_child_weight": 8.0,
+    "gamma": 0.1,
+    "reg_alpha": 0.01,
+    "reg_lambda": 8.0,
+    "subsample": 0.85,
+    "colsample_bytree": 0.85,
+    "learning_rate": 0.04
+  },
+  "trial": 1,
+  "rounds": [
+    840,
+    739,
+    712,
+    655
+  ],
+  "fold_auc": [
+    0.941866172311268,
+    0.940639656893865,
+    0.9415692241311749,
+    0.9419670489331645
+  ],
+  "dev_auc": 0.9415018095567443,
+  "seconds": 345.58443450927734
+}

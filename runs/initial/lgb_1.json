@@ -1,0 +1,30 @@
+{
+  "family": "lgb",
+  "variant": "interaction",
+  "params": {
+    "max_depth": 6,
+    "num_leaves": 31,
+    "min_child_samples": 80,
+    "reg_alpha": 0.01,
+    "reg_lambda": 8.0,
+    "subsample": 0.85,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.85,
+    "learning_rate": 0.04
+  },
+  "trial": 1,
+  "rounds": [
+    631,
+    680,
+    628,
+    620
+  ],
+  "fold_auc": [
+    0.9419242943360331,
+    0.9408140824438712,
+    0.9417262223707616,
+    0.9419856799060637
+  ],
+  "dev_auc": 0.9416021346940469,
+  "seconds": 198.35132837295532
+}

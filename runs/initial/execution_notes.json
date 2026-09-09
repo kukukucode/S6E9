@@ -1,0 +1,12 @@
+{
+  "completed_families": [
+    "lgb",
+    "xgb"
+  ],
+  "deferred_family": "cat",
+  "reason": "CatBoost first development fold was still running after approximately 9.5 minutes. Stopped by the agent for the initial prototype compute budget, not due to a model error or a measured poor score.",
+  "catboost_full_data_auc": null,
+  "catboost_support": "Implemented; all 5 feature variants tested on small data.",
+  "config_change": "Only participating families changed before freezing and before accessing sealed scores. Original configuration preserved as config_requested.json.",
+  "recorded_at": 1788948838.4296527
+}

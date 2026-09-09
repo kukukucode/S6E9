@@ -1,0 +1,18 @@
+{
+  "sealed_auc": 0.9418370165345737,
+  "baseline_sealed_auc": 0.9417045795263432,
+  "public_lb": null,
+  "public_lb_target": 0.94635,
+  "sealed_rows": 133733,
+  "note": "Public LB is unmeasured. Do not tune using this sealed result.",
+  "delta_vs_baseline": 0.00013243700823051263,
+  "auc_95_ci": [
+    0.9404617135306789,
+    0.9431878516753235
+  ],
+  "delta_95_ci": [
+    8.06061497777566e-05,
+    0.00018014015388511105
+  ],
+  "bootstrap_replicates": 300
+}

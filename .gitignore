@@ -1,0 +1,16 @@
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+kaggle.json
+*.log
+*.zip
+/data/
+/work/
+/runs/*/models/
+optuna.db-journal
+optuna.db-wal
+optuna.db-shm

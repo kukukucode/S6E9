@@ -1,0 +1,14 @@
+,dev_missing,test_missing,dev_unique,test_unique
+Age,0.0,0.0,45,45
+Annual_Income_USD,0.0,0.0,12349,10526
+Daily_Commute_km,0.0,0.0,796,781
+Number_of_Cars_Owned,0.0,0.0,4,4
+Charging_Stations_Near_Home,0.0,0.0,15,15
+Charging_Stations_Near_Work,0.0,0.0,20,20
+Environmental_Concern_Level,0.0,0.0,5,5
+Gender,0.0,0.0,3,3
+City_Type,0.0,0.0,3,3
+Current_Car_Type,0.0,0.0,4,4
+Home_Charging_Possible,0.0,0.0,2,2
+Subsidy_Available,0.0,0.0,2,2
+Range_Anxiety_Level,0.0,0.0,3,3

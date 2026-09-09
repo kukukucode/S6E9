@@ -1,0 +1,122 @@
+{
+  "candidates": [
+    {
+      "family": "lgb",
+      "variant": "raw",
+      "params": {
+        "max_depth": 6,
+        "num_leaves": 31,
+        "min_child_samples": 80,
+        "reg_alpha": 0.01,
+        "reg_lambda": 8.0,
+        "subsample": 0.85,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.85,
+        "learning_rate": 0.04
+      },
+      "trial": 0,
+      "rounds": [
+        590,
+        710,
+        778,
+        748
+      ],
+      "fold_auc": [
+        0.942001230864985,
+        0.9409327876919389,
+        0.941902209035705,
+        0.9421925934817463
+      ],
+      "dev_auc": 0.9417468412110892,
+      "seconds": 166.06794905662537,
+      "fixed_rounds": 729,
+      "seed_dev_auc": 0.9417468412110892,
+      "seed_fold_auc": [
+        0.942001230864985,
+        0.9409327876919389,
+        0.941902209035705,
+        0.9421925934817463
+      ]
+    },
+    {
+      "family": "xgb",
+      "variant": "raw",
+      "params": {
+        "max_depth": 5,
+        "min_child_weight": 8.0,
+        "gamma": 0.1,
+        "reg_alpha": 0.01,
+        "reg_lambda": 8.0,
+        "subsample": 0.85,
+        "colsample_bytree": 0.85,
+        "learning_rate": 0.04
+      },
+      "trial": 0,
+      "rounds": [
+        829,
+        752,
+        824,
+        904
+      ],
+      "fold_auc": [
+        0.9420305807777519,
+        0.9407992940364006,
+        0.9417462940147697,
+        0.9421862361422743
+      ],
+      "dev_auc": 0.9416838642431195,
+      "seconds": 311.4248995780945,
+      "fixed_rounds": 826,
+      "seed_dev_auc": 0.9416838642431195,
+      "seed_fold_auc": [
+        0.9420305807777519,
+        0.9407992940364006,
+        0.9417462940147697,
+        0.9421862361422743
+      ]
+    }
+  ],
+  "baseline": {
+    "family": "lgb",
+    "variant": "raw",
+    "params": {
+      "max_depth": 6,
+      "num_leaves": 31,
+      "min_child_samples": 80,
+      "reg_alpha": 0.01,
+      "reg_lambda": 8.0,
+      "subsample": 0.85,
+      "subsample_freq": 1,
+      "colsample_bytree": 0.85,
+      "learning_rate": 0.04
+    },
+    "trial": -1,
+    "rounds": [
+      590,
+      710,
+      778,
+      748
+    ],
+    "fold_auc": [
+      0.942001230864985,
+      0.9409327876919389,
+      0.941902209035705,
+      0.9421925934817463
+    ],
+    "fixed_rounds": 729,
+    "seed_dev_auc": 0.9417468412110892,
+    "seed_fold_auc": [
+      0.942001230864985,
+      0.9409327876919389,
+      0.941902209035705,
+      0.9421925934817463
+    ]
+  },
+  "weights": [
+    0.5714285714285714,
+    0.42857142857142855
+  ],
+  "development_selection_auc": 0.9418261514625301,
+  "warning": "Development AUC is selection-biased; sealed audit is the independent check.",
+  "config_sha256": "fd28a9c145ebcc77cd165f391a05ab05988961e8fe2a84e1fc36c99ba5f26b50"
+}
