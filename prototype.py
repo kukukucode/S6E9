@@ -700,6 +700,8 @@ def diagnose(args):
 
 def check_device(args):
     """Small real fit before a long run; never silently substitute CPU for CUDA."""
+    print(f"LightGBM {importlib.metadata.version('lightgbm')}; Python {platform.python_version()}; "
+          f"device={args.lgb_device}; gpu_id={args.lgb_gpu_id}", flush=True)
     rng = np.random.default_rng(SEED)
     x = pd.DataFrame(rng.normal(size=(4096, 5)), columns=[f"f{i}" for i in range(5)])
     x["category"] = pd.Categorical(rng.integers(0, 4, len(x)))
@@ -708,8 +710,11 @@ def check_device(args):
     params.update(max_bin=511, min_child_samples=20)
     cfg = dict(max_rounds=4, early_stopping=2, threads=args.threads,
                lgb_device=args.lgb_device, lgb_gpu_id=args.lgb_gpu_id)
+    print("CHECK_STAGE: fit begin (max_bin=511, categories, bagging, validation)", flush=True)
     model, _ = fit_model("lgb", params, x.iloc[:3072], y[:3072], (x.iloc[3072:], y[3072:]), SEED, cfg)
+    print("CHECK_STAGE: fit completed; predict begin", flush=True)
     predict(model, x.iloc[3072:], "lgb")
+    print("CHECK_STAGE: predict completed", flush=True)
     actual = model.booster_.params.get("device_type", "cpu")
     if actual != args.lgb_device:
         raise RuntimeError(f"Requested {args.lgb_device}, but got {actual}")

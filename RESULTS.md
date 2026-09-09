@@ -1,3 +1,13 @@
+# v4.1: Kaggle T4でのCUDAクラッシュ対策
+
+ユーザーログではLightGBM 4.6.0のCUDAビルド成功後、check-deviceがSIGSEGV（signal 11）で終了しました。GPU自体はT4を2枚認識しています。根本原因はまだ未確定です。
+旧版を引き継ぐビルドを改め、未対応ビルドまたはネイティブクラッシュの場合に4.7.0を使用中GPU向けに一度だけビルドします。4.7.0にはCUDAヒストグラム等の修正がありますが、今回の原因がそれと同じとは断定していません。
+診断を子プロセスで実行し、Python faulthandler・段階表示・標準出力/エラー・終了コードをgpu_preflight_before.log / gpu_preflight_after.logへ保存します。再度落ちた場合は修復を繰り返さず、原因を表示して停止します。
+新しいrunはs6e9_signals_v4_1_cudaです。モデル設定、特徴量、max_bin=511は維持。48テスト通過（GPU経路・クラッシュ修復は模擬テスト）。GPU実機での解消・速度・AUCは未確認です。
+[LightGBMリリース情報](https://github.com/lightgbm-org/LightGBM/releases/tag/v4.7.0)
+
+---
+
 # Kaggle GPU対応（v4）
 
 現在の `S6E9_Prototype.ipynb` はKaggleのNVIDIA GPUを使うLightGBM CUDA設定です。
