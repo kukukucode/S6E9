@@ -2,6 +2,7 @@
 import ast
 import csv
 import json
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
@@ -78,6 +79,46 @@ class NotebookDataTests(unittest.TestCase):
     def test_missing_input_root(self):
         with self.assertRaisesRegex(FileNotFoundError, 'Add Input'):
             self.find(self.root / 'not-mounted')
+
+
+class NotebookSubmissionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        notebook = json.loads(Path(__file__).with_name('S6E9_Prototype.ipynb').read_text(encoding='utf-8'))
+        source = next(''.join(c['source']) for c in notebook['cells']
+                      if c['cell_type'] == 'code' and 'def export_submission(' in ''.join(c['source']))
+        function = next(n for n in ast.parse(source).body
+                        if isinstance(n, ast.FunctionDef) and n.name == 'export_submission')
+        scope = {'Path': Path, 'shutil': shutil}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), '<notebook-export>', 'exec'), scope)
+        cls.export = staticmethod(scope['export_submission'])
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.working = Path(self.temporary.name)
+        self.run = self.working / 's6e9_run'
+        self.run.mkdir()
+
+    def test_nested_submission_is_exported_to_working_root_unchanged(self):
+        content = b'id,Will_Buy_EV\r\n668665,0.25\r\n668666,0.8\r\n'
+        source = self.run / 'submission.csv'
+        source.write_bytes(content)
+        result = self.export(self.run, self.working)
+        self.assertEqual(result, self.working / 'submission.csv')
+        self.assertEqual(result.read_bytes(), content)
+        self.assertEqual(source.read_bytes(), content)
+
+    def test_missing_model_output_never_creates_a_dummy_submission(self):
+        with self.assertRaises(FileNotFoundError):
+            self.export(self.run, self.working)
+        self.assertFalse((self.working / 'submission.csv').exists())
+
+    def test_export_already_at_root_is_safe_to_repeat(self):
+        source = self.working / 'submission.csv'
+        source.write_bytes(b'id,Will_Buy_EV\n668665,0.25\n')
+        self.assertEqual(self.export(self.working, self.working), source)
+        self.assertEqual(self.export(self.working, self.working), source)
 
 
 if __name__ == '__main__':
