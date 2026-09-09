@@ -259,7 +259,6 @@ def context(args, create=False):
     if create and not cfg_path.exists():
         cfg = dict(seed=SEED, max_rounds=args.max_rounds, early_stopping=args.early_stopping,
             threads=args.threads, xgb_device=args.xgb_device, seeds=args.seeds,
-            holdout_previously_reviewed=args.holdout_already_reviewed,
             hashes=hashes, code_sha256=code_hash, families=args.families,
             versions={p: importlib.metadata.version(p) for p in ("numpy", "pandas", "scikit-learn", "xgboost", "lightgbm", "catboost", "optuna")},
             python=platform.python_version())
@@ -271,8 +270,6 @@ def context(args, create=False):
         for key in ("max_rounds", "early_stopping", "threads", "xgb_device", "seeds", "families"):
             if getattr(args, key) != cfg[key]:
                 raise ValueError(f"Resume configuration changed: {key}")
-        if args.holdout_already_reviewed != cfg.get("holdout_previously_reviewed", False):
-            raise ValueError("Resume configuration changed: holdout review status")
     y = tr[TARGET].to_numpy(dtype=int)
     dev, sealed, cv, outer = split_plan(y, cfg["seed"])
     return tr, te, sub, id_col, features, run, cfg, y, dev, sealed, cv, outer
@@ -306,16 +303,15 @@ def search(args):
     for family in cfg["families"]:
         study = optuna.create_study(study_name=family, storage=f"sqlite:///{(run / 'optuna.db').resolve().as_posix()}",
             load_if_exists=True, direction="maximize", sampler=optuna.samplers.TPESampler(seed=cfg["seed"]))
-        # Test encodings at the same baseline parameters before the wider search.
+        # Every family gets a raw baseline even when only one trial is requested.
         if not study.trials:
-            for variant in ("raw", "frequency", "target", "interaction"):
+            for variant in ("raw", "interaction"):
                 study.enqueue_trial({"variant": variant, **{k: v for k, v in defaults(family).items() if k not in ("subsample_freq", "bootstrap_type")}})
         study.sampler = optuna.samplers.TPESampler(seed=cfg["seed"] + len(study.trials))
         def objective(trial):
             started = time.time()
             variant = trial.suggest_categorical("variant", ["raw", "frequency", "interaction", "artifact", "target"])
             candidate = dict(family=family, variant=variant, params=suggest(trial, family), trial=trial.number)
-            print(f"Starting {family} trial={trial.number}, features={variant}; search seed={cfg['seed']}", flush=True)
             oof, rounds, scores = run_cv(tr[cols], y, cv, candidate, cfg, [cfg["seed"]])
             name = f"{family}_{trial.number}"
             np.save(run / f"{name}_oof.npy", oof)
@@ -391,9 +387,7 @@ def freeze(args):
     report.to_csv(run / "dev_oof.csv", index=False)
     write_json(run / "frozen.json", dict(candidates=candidates, baseline=baseline,
         weights=weights.tolist(), development_selection_auc=score,
-        warning=("Development AUC is selection-biased. This holdout was reviewed previously; its audit is not a fresh independent evaluation."
-                 if cfg.get("holdout_previously_reviewed", False) else
-                 "Development AUC is selection-biased; sealed audit is the independent check."),
+        warning="Development AUC is selection-biased; sealed audit is the independent check.",
         config_sha256=digest(run / "config.json")))
     print(f"Frozen dev selection AUC={score:.6f}; weights={weights}. Next: audit.", flush=True)
 
@@ -446,10 +440,7 @@ def audit(args):
     report = dict(sealed_auc=float(roc_auc_score(y[sealed], p)),
         baseline_sealed_auc=float(roc_auc_score(y[sealed], baseline)), public_lb=None,
         public_lb_target=0.94635, sealed_rows=len(sealed),
-        holdout_previously_reviewed=cfg.get("holdout_previously_reviewed", False),
-        note=("Public LB is unmeasured. This holdout split was reviewed previously; this is not a fresh independent evaluation. Do not tune using this result."
-              if cfg.get("holdout_previously_reviewed", False) else
-              "Public LB is unmeasured. Do not tune using this sealed result."))
+        note="Public LB is unmeasured. Do not tune using this sealed result.")
     report["delta_vs_baseline"] = report["sealed_auc"] - report["baseline_sealed_auc"]
     report.update(paired_bootstrap(y[sealed], p, baseline))
     pd.DataFrame({id_col: tr[id_col].iloc[sealed].to_numpy(), TARGET: y[sealed], "prediction": p, "baseline": baseline}).to_csv(run / "sealed_predictions.csv", index=False)
@@ -530,17 +521,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["diagnose", "search", "freeze", "audit", "finalize"])
     parser.add_argument("--data", default="/kaggle/input/competitions/playground-series-s6e9")
-    parser.add_argument("--run", default="runs/tuned_v2")
-    parser.add_argument("--trials", type=int, default=20, help="Total completed trials per family; increase to resume")
-    parser.add_argument("--families", nargs="+", choices=["xgb", "cat", "lgb"], default=["lgb", "xgb"])
-    parser.add_argument("--max-rounds", type=int, default=5000)
-    parser.add_argument("--early-stopping", type=int, default=200)
+    parser.add_argument("--run", default="runs/prototype")
+    parser.add_argument("--trials", type=int, default=8, help="Total completed trials per family; increase to resume")
+    parser.add_argument("--families", nargs="+", choices=["xgb", "cat", "lgb"], default=["xgb", "cat", "lgb"])
+    parser.add_argument("--max-rounds", type=int, default=3000)
+    parser.add_argument("--early-stopping", type=int, default=150)
     parser.add_argument("--threads", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--xgb-device", choices=["cpu", "cuda"], default="cpu")
-    parser.add_argument("--seeds", nargs="+", type=int, default=[2026, 42, 3407],
-                        help="Seeds used after model selection; search always uses the single split seed")
-    parser.add_argument("--holdout-already-reviewed", action="store_true",
-                        help="Mark a reused holdout as previously reviewed, not fresh independent evidence")
+    parser.add_argument("--seeds", nargs="+", type=int, default=[2026, 42])
     parser.add_argument("--save-models", action="store_true")
     args = parser.parse_args()
     if min(args.trials, args.max_rounds, args.early_stopping, args.threads) < 1:
