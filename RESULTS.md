@@ -1,3 +1,22 @@
+# Kaggle GPU対応（v4）
+
+現在の `S6E9_Prototype.ipynb` はKaggleのNVIDIA GPUを使うLightGBM CUDA設定です。
+KaggleのSettings → AcceleratorでGPUを選択し、InternetをOnにして、GitHubから最新Notebookを再ImportしてRun Allしてください。
+初期画面の見出しは「S6E9: 数値TE・桁特徴量＋Kaggle GPU」です。各20候補・3seedと書かれたNotebookは旧v2です。
+
+CUDAビルドが未導入の場合に限り、同じLightGBMバージョンをCUDA有効でビルドします。初回セットアップには数分以上かかる場合があります。
+学習前にmax_bin=511とカテゴリ列を含む小規模な実学習を行い、GPUを使えない場合は理由を表示します。CPUへの自動切り替えは行いません。
+特徴量・学習設定・ビン数はv3と同じ。前処理・TE・分布差診断・CSV出力はCPUです。GPUは1枚使用します。
+保存先は `/kaggle/working/s6e9_signals_v4_cuda`、提出CSVは `/kaggle/working/submission.csv`。CPUで実行する場合は `LGB_DEVICE='cpu'` にします。
+
+**GPU実機での速度・AUCは未計測です。** 46テスト通過（CUDA設定・セットアップ分岐は模擬テスト、CPU学習・予測は実行）。CPU版は保存済みv3との予測一致を確認しました。
+GPU計算ではCPU版と同じ予測・AUCになるとは限りません。以下の0.946004はv3のCPU実測値です。
+v3の正確な学習コードは `runs/signals_v3/prototype_snapshot.py`、提出CSVと実験記録も同フォルダに保存しています。
+
+方式・ビルド手順: [LightGBM CUDA公式ガイド](https://lightgbm.readthedocs.io/en/latest/Installation-Guide.html#build-cuda-version)、[Pythonパッケージのビルド手順](https://github.com/lightgbm-org/LightGBM/blob/main/python-package/README.rst#build-cuda-version)。
+
+---
+
 # S6E9 改訂版の実測結果（2026-09-10）
 
 LightGBM・1seedの最終5-fold OOFは **0.946003647**。初回LGBM＋XGBoostの 0.941987578 に対し **+0.004016068** でした。
@@ -44,7 +63,7 @@ LightGBM・1seedの最終5-fold OOFは **0.946003647**。初回LGBM＋XGBoostの
 
 37テスト通過。既存5種類の前処理が修正前と一致。実データの基準LGBMは全development OOF予測が初回と完全一致しました。
 提出CSVは286,571行でテンプレートのID・列順に一致し、欠損なし、有限の0〜1確率です。保存済みモデル別予測との最大誤差は 1.11e-16。
-Notebookに埋め込んだスクリプトは、実測に使ったprototype.pyとバイト単位で一致します。実行済み環境はconfig.jsonに記録しました。
+v3実測時のNotebookに埋め込んだスクリプトは、実測に使ったprototype.pyとバイト単位で一致していました。実行済み環境はconfig.jsonに記録しました。
 
 そのまま提出するファイル: `runs/signals_v3/submission.csv`。
 Kaggleで学習を再現する場合はGitHubから `S6E9_Prototype.ipynb` をImportし、公式コンペデータをInputに追加してRun All。最終CSVは `/kaggle/working/submission.csv` にも保存します。

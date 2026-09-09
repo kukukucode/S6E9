@@ -305,8 +305,13 @@ def fit_model(family, params, x, y, valid, seed, cfg, rounds=None):
         best = model.best_iteration + 1 if valid else n
     elif family == "lgb":
         import lightgbm as lgb
+        device = cfg.get("lgb_device", "cpu")
+        backend = (dict(deterministic=True, force_col_wise=True) if device == "cpu" else
+                   dict(device_type="cuda", gpu_device_id=cfg.get("lgb_gpu_id", 0), num_gpu=1))
+        if device not in ("cpu", "cuda"):
+            raise ValueError("LightGBM device must be cpu or cuda")
         model = lgb.LGBMClassifier(**params, n_estimators=n, objective="binary", metric="auc",
-            n_jobs=cfg["threads"], random_state=seed, verbosity=-1, deterministic=True, force_col_wise=True)
+            n_jobs=cfg["threads"], random_state=seed, verbosity=-1, **backend)
         model.fit(x, y, eval_set=[valid] if valid else None,
             callbacks=[lgb.early_stopping(stop, verbose=False)] if valid else [])
         best = model.best_iteration_ if valid else n
@@ -371,6 +376,7 @@ def context(args, create=False):
     if create and not cfg_path.exists():
         cfg = dict(seed=SEED, max_rounds=args.max_rounds, early_stopping=args.early_stopping,
             threads=args.threads, xgb_device=args.xgb_device, seeds=args.seeds,
+            lgb_device=args.lgb_device, lgb_gpu_id=args.lgb_gpu_id,
             holdout_previously_reviewed=args.holdout_already_reviewed, profile=args.profile,
             hashes=hashes, code_sha256=code_hash, families=args.families,
             versions={p: importlib.metadata.version(p) for p in ("numpy", "pandas", "scikit-learn", "xgboost", "lightgbm", "catboost", "optuna")},
@@ -380,7 +386,7 @@ def context(args, create=False):
     if cfg["hashes"] != hashes or cfg["code_sha256"] != code_hash:
         raise ValueError("Data/code changed. Use a fresh run directory; do not reuse a revealed sealed holdout for tuning.")
     if create:
-        for key in ("max_rounds", "early_stopping", "threads", "xgb_device", "seeds", "families", "profile"):
+        for key in ("max_rounds", "early_stopping", "threads", "xgb_device", "lgb_device", "lgb_gpu_id", "seeds", "families", "profile"):
             if getattr(args, key) != cfg[key]:
                 raise ValueError(f"Resume configuration changed: {key}")
         if args.holdout_already_reviewed != cfg.get("holdout_previously_reviewed", False):
@@ -692,11 +698,29 @@ def diagnose(args):
     print(json.dumps(report, indent=2), flush=True)
 
 
+def check_device(args):
+    """Small real fit before a long run; never silently substitute CPU for CUDA."""
+    rng = np.random.default_rng(SEED)
+    x = pd.DataFrame(rng.normal(size=(4096, 5)), columns=[f"f{i}" for i in range(5)])
+    x["category"] = pd.Categorical(rng.integers(0, 4, len(x)))
+    y = (x.f0.to_numpy() + x.f1.to_numpy() + rng.normal(size=len(x)) > 0).astype(int)
+    params = defaults("lgb")
+    params.update(max_bin=511, min_child_samples=20)
+    cfg = dict(max_rounds=4, early_stopping=2, threads=args.threads,
+               lgb_device=args.lgb_device, lgb_gpu_id=args.lgb_gpu_id)
+    model, _ = fit_model("lgb", params, x.iloc[:3072], y[:3072], (x.iloc[3072:], y[3072:]), SEED, cfg)
+    predict(model, x.iloc[3072:], "lgb")
+    actual = model.booster_.params.get("device_type", "cpu")
+    if actual != args.lgb_device:
+        raise RuntimeError(f"Requested {args.lgb_device}, but got {actual}")
+    print(f"LightGBM backend check passed: {actual}, max_bin=511, categorical features enabled", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["diagnose", "search", "freeze", "audit", "finalize"])
+    parser.add_argument("command", choices=["check-device", "diagnose", "search", "freeze", "audit", "finalize"])
     parser.add_argument("--data", default="/kaggle/input/competitions/playground-series-s6e9")
-    parser.add_argument("--run", default="runs/signals_v3")
+    parser.add_argument("--run", default="runs/signals_v4")
     parser.add_argument("--profile", choices=["signals", "legacy"], default="signals")
     parser.add_argument("--trials", type=int, default=6, help="Total completed trials per family; increase to resume")
     parser.add_argument("--families", nargs="+", choices=["xgb", "cat", "lgb"], default=["lgb"])
@@ -704,6 +728,8 @@ def main():
     parser.add_argument("--early-stopping", type=int, default=120)
     parser.add_argument("--threads", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--xgb-device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--lgb-device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--lgb-gpu-id", type=int, default=0, help="Single CUDA device used by LightGBM")
     parser.add_argument("--seeds", nargs="+", type=int, default=[2026],
                         help="Seeds used after model selection; search always uses the single split seed")
     parser.add_argument("--holdout-already-reviewed", action="store_true",
@@ -712,9 +738,11 @@ def main():
     args = parser.parse_args()
     if min(args.trials, args.max_rounds, args.early_stopping, args.threads) < 1:
         parser.error("Numeric budgets must be positive")
+    if args.lgb_gpu_id < 0:
+        parser.error("GPU device ID must be nonnegative")
     if len(set(args.seeds)) != len(args.seeds) or len(set(args.families)) != len(args.families):
         parser.error("Duplicate seeds/families")
-    globals()[args.command](args)
+    globals()[args.command.replace("-", "_")](args)
 
 
 if __name__ == "__main__":
