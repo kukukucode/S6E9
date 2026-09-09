@@ -1,0 +1,31 @@
+{
+  "family": "lgb",
+  "variant": "raw",
+  "params": {
+    "max_depth": 6,
+    "num_leaves": 31,
+    "min_child_samples": 80,
+    "reg_alpha": 0.01,
+    "reg_lambda": 8.0,
+    "subsample": 0.85,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.85,
+    "learning_rate": 0.04,
+    "max_bin": 255
+  },
+  "trial": 0,
+  "rounds": [
+    590,
+    710,
+    778,
+    748
+  ],
+  "fold_auc": [
+    0.942001230864985,
+    0.9409327876919389,
+    0.941902209035705,
+    0.9421925934817463
+  ],
+  "dev_auc": 0.9417468412110892,
+  "seconds": 159.49132704734802
+}

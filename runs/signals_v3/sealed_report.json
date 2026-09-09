@@ -1,0 +1,19 @@
+{
+  "sealed_auc": 0.9458488871959224,
+  "baseline_sealed_auc": 0.9417045795263432,
+  "public_lb": null,
+  "public_lb_target": 0.94635,
+  "sealed_rows": 133733,
+  "holdout_previously_reviewed": true,
+  "note": "Public LB is unmeasured. This holdout split was reviewed previously; this is not a fresh independent evaluation. Do not tune using this result.",
+  "delta_vs_baseline": 0.004144307669579184,
+  "auc_95_ci": [
+    0.9445306165461941,
+    0.9470738977334191
+  ],
+  "delta_95_ci": [
+    0.0038053250114996467,
+    0.004468150034136286
+  ],
+  "bootstrap_replicates": 300
+}

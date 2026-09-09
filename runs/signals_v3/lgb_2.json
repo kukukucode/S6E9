@@ -1,0 +1,31 @@
+{
+  "family": "lgb",
+  "variant": "digits_te",
+  "params": {
+    "max_depth": 6,
+    "num_leaves": 31,
+    "min_child_samples": 80,
+    "reg_alpha": 0.01,
+    "reg_lambda": 8.0,
+    "subsample": 0.85,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.85,
+    "learning_rate": 0.04,
+    "max_bin": 255
+  },
+  "trial": 2,
+  "rounds": [
+    657,
+    872,
+    683,
+    467
+  ],
+  "fold_auc": [
+    0.9452743087135549,
+    0.9444779602402175,
+    0.9456852088817094,
+    0.9453844084688913
+  ],
+  "dev_auc": 0.9451947533474834,
+  "seconds": 394.5450520515442
+}

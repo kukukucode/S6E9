@@ -1,0 +1,86 @@
+{
+  "candidates": [
+    {
+      "family": "lgb",
+      "variant": "multiscale_dual",
+      "params": {
+        "max_depth": 5,
+        "num_leaves": 31,
+        "min_child_samples": 20,
+        "reg_alpha": 0.07,
+        "reg_lambda": 2.0,
+        "subsample": 0.85,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.5,
+        "learning_rate": 0.04,
+        "max_bin": 511
+      },
+      "trial": 5,
+      "rounds": [
+        494,
+        576,
+        490,
+        620
+      ],
+      "fold_auc": [
+        0.9456763451650909,
+        0.944995947059351,
+        0.9460845230366126,
+        0.9460128971670545
+      ],
+      "dev_auc": 0.94568348097424,
+      "seconds": 330.1155071258545,
+      "fixed_rounds": 535,
+      "seed_dev_auc": 0.94568348097424,
+      "seed_fold_auc": [
+        0.9456763451650909,
+        0.944995947059351,
+        0.9460845230366126,
+        0.9460128971670545
+      ]
+    }
+  ],
+  "baseline": {
+    "family": "lgb",
+    "variant": "raw",
+    "params": {
+      "max_depth": 6,
+      "num_leaves": 31,
+      "min_child_samples": 80,
+      "reg_alpha": 0.01,
+      "reg_lambda": 8.0,
+      "subsample": 0.85,
+      "subsample_freq": 1,
+      "colsample_bytree": 0.85,
+      "learning_rate": 0.04,
+      "max_bin": 255
+    },
+    "trial": -1,
+    "rounds": [
+      590,
+      710,
+      778,
+      748
+    ],
+    "fold_auc": [
+      0.942001230864985,
+      0.9409327876919389,
+      0.941902209035705,
+      0.9421925934817463
+    ],
+    "fixed_rounds": 729,
+    "seed_dev_auc": 0.9417468412110892,
+    "seed_fold_auc": [
+      0.942001230864985,
+      0.9409327876919389,
+      0.941902209035705,
+      0.9421925934817463
+    ]
+  },
+  "weights": [
+    1.0
+  ],
+  "development_selection_auc": 0.94568348097424,
+  "warning": "Development AUC is selection-biased. This holdout was reviewed previously; its audit is not a fresh independent evaluation.",
+  "config_sha256": "05e03a306a4c95888071adea331456e7fcbbfbe326a929ada9110366625b3f16"
+}

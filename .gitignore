@@ -11,6 +11,7 @@ kaggle.json
 /data/
 /work/
 /runs/*/models/
+/runs/*/cache/
 optuna.db-journal
 optuna.db-wal
 optuna.db-shm

@@ -20,7 +20,7 @@ def test_encoding_trials_then_three_seed_finalists_and_submission(tmp_path, monk
     frame.iloc[:600].to_csv(data / 'train.csv', index=False)
     frame.iloc[600:].drop(columns=p.TARGET).to_csv(data / 'test.csv', index=False)
     pd.DataFrame({'id': np.arange(799, 599, -1), p.TARGET: .5}).to_csv(data / 'sample_submission.csv', index=False)
-    common = ['--data', str(data), '--run', str(run), '--families', 'lgb', '--trials', '3',
+    common = ['--data', str(data), '--run', str(run), '--profile', 'legacy', '--families', 'lgb', '--trials', '3',
         '--max-rounds', '8', '--early-stopping', '3', '--threads', '2',
         '--seeds', '2026', '42', '3407', '--holdout-already-reviewed']
     calls = []
@@ -58,3 +58,9 @@ def test_encoding_trials_then_three_seed_finalists_and_submission(tmp_path, monk
     submission = pd.read_csv(run / 'submission.csv')
     assert submission.id.tolist() == list(range(799, 599, -1))
     assert submission[p.TARGET].between(0, 1).all()
+    before = (run / 'submission.csv').read_bytes()
+    def unexpected_fit(*args, **kwargs):
+        raise AssertionError('Finalization must reuse completed fits')
+    monkeypatch.setattr(p, 'fit_model', unexpected_fit)
+    execute('finalize')
+    assert (run / 'submission.csv').read_bytes() == before

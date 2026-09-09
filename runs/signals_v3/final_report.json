@@ -1,0 +1,7 @@
+{
+  "final_oof_auc": 0.94600364664444,
+  "public_lb": null,
+  "note": "Final OOF reuses development-selected configurations and is NOT an independent score estimate.",
+  "submission_rows": 286571,
+  "submission_sha256": "64836817806113f39bc5af8c6cc33ad8678f8e90448808347f217f3460d7f89a"
+}

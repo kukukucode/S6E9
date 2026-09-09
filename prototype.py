@@ -144,31 +144,142 @@ class Features:
         self.freq_cols = list(z) if self.variant in ("frequency", "artifact") else []
         self.freq = {c: self.tokens(z[c]).value_counts(normalize=True) for c in self.freq_cols}
         self.te = {c: self.te_map(self.tokens(z[c]), y) for c in self.cats} if self.variant == "target" else {}
-        result = self.transform(x)
+        result = self._transform_augmented(z, include_te=False)
         # KFold assignment does not depend on labels. Both map AND prior exclude each row.
         if self.te:
+            splits = list(KFold(4, shuffle=True, random_state=self.seed).split(z))
             for c in self.cats:
+                tokens = self.tokens(z[c])
                 values = np.empty(len(z), dtype=np.float32)
-                for tr, va in KFold(4, shuffle=True, random_state=self.seed).split(z):
-                    mapping, prior = self.te_map(self.tokens(z[c]).iloc[tr], np.asarray(y)[tr])
-                    values[va] = self.tokens(z[c]).iloc[va].map(mapping).fillna(prior)
+                for tr, va in splits:
+                    mapping, prior = self.te_map(tokens.iloc[tr], np.asarray(y)[tr])
+                    values[va] = tokens.iloc[va].map(mapping).fillna(prior)
                 result[c + "_te"] = values
         return result
 
     def transform(self, x):
         z = augment(x, self.variant)
+        return self._transform_augmented(z)
+
+    def _transform_augmented(self, z, include_te=True):
         out = z.copy()
         for c in self.cats:
             codes = self.tokens(z[c]).map(self.maps[c]).fillna(0).astype(int)
             out[c] = pd.Categorical(codes, categories=range(len(self.maps[c]) + 1))
         for c in self.freq_cols:
             out[c + "_freq"] = self.tokens(z[c]).map(self.freq[c]).fillna(0).astype(np.float32)
-        for c, (mapping, prior) in self.te.items():
+        for c, (mapping, prior) in (self.te.items() if include_te else []):
             out[c + "_te"] = self.tokens(z[c]).map(mapping).fillna(prior).astype(np.float32)
         for c in out:
             if c not in self.cats:
                 out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan).astype(np.float32)
         return out
+
+
+SIGNAL_VARIANTS = ("numeric_te", "digits_te", "multiscale_te", "multiscale_dual")
+
+
+class SignalFeatures:
+    """Numeric/digit keys with fit-only frequency and label-independent cross-fit TE.
+
+    Inspired by Naji's S6E9 feature experiments; implementation is independent.
+    https://www.kaggle.com/code/najiama/pure-lgbm-model-cv-0-94606-lb-0-94637
+    No reference submission, test labels, or external labels are used.
+    """
+    def __init__(self, variant, seed=SEED):
+        self.variant, self.seed = variant, seed
+        self.smoothing = (10., 100.) if variant == "multiscale_dual" else (20.,)
+
+    def keys(self, x):
+        # Build keys before float32 conversion: income digits can be lost on downcast.
+        x = x.reset_index(drop=True)
+        keys = {f"k{i}": Features.tokens(x[c]) for i, c in enumerate(x)}
+        numeric = {}
+        if self.variant != "numeric_te":
+            for i, c in enumerate(x):
+                if not pd.api.types.is_numeric_dtype(x[c]) or c == "Number_of_Cars_Owned":
+                    continue
+                values = pd.to_numeric(x[c], errors="coerce").to_numpy(dtype=np.float64)
+                for power in range(-4, 4):
+                    name = f"d{i}_{power + 4}"
+                    with np.errstate(invalid="ignore"):
+                        digit = np.floor_divide(values, 10. ** power) % 10
+                    numeric[name] = digit.astype(np.float32)
+                    keys[name] = Features.tokens(pd.Series(digit))
+        if self.variant in ("multiscale_te", "multiscale_dual"):
+            scales = {"Annual_Income_USD": (1., 100., 1000.), "Daily_Commute_km": (1., 5., 10.)}
+            for column, widths in scales.items():
+                if column not in x:
+                    continue
+                values = pd.to_numeric(x[column], errors="coerce").to_numpy(dtype=np.float64)
+                for j, width in enumerate(widths):
+                    name = f"b{list(x).index(column)}_{j}"
+                    bins = np.floor(values / width)
+                    numeric[name] = bins.astype(np.float32)
+                    keys[name] = Features.tokens(pd.Series(bins))
+        return pd.DataFrame(keys), pd.DataFrame(numeric, index=x.index)
+
+    def fit_transform(self, x, y):
+        y = np.asarray(y, dtype=np.float64)
+        self.base = Features("raw", self.seed)
+        base = self.base.fit_transform(x, y)
+        keys, numeric = self.keys(x)
+        # Fit-only pruning: validation/test values do not select columns.
+        self.keep = []
+        seen = set()
+        for c in keys:
+            if keys[c].nunique(dropna=False) <= 1:
+                continue
+            signature = hashlib.sha256(pd.util.hash_pandas_object(keys[c], index=False).values.tobytes()).hexdigest()
+            if signature not in seen:
+                seen.add(signature)
+                self.keep.append(c)
+        self.numeric_keep = [c for c in numeric if c in self.keep]
+        self.maps = {}
+        splits = list(KFold(4, shuffle=True, random_state=self.seed).split(y))
+        extras = {c: numeric[c].to_numpy() for c in self.numeric_keep}
+        for c in self.keep:
+            codes, levels = pd.factorize(keys[c], sort=True)
+            size = len(levels)
+            counts = np.bincount(codes, minlength=size).astype(float)
+            sums = np.bincount(codes, weights=y, minlength=size)
+            prior = float(y.mean())
+            frequency = counts / len(y)
+            full = [(sums + strength * prior) / (counts + strength) for strength in self.smoothing]
+            self.maps[c] = (pd.Index(levels), frequency, full, prior)
+            extras[c + "_freq"] = frequency[codes].astype(np.float32)
+            oof = np.empty((len(y), len(self.smoothing)), dtype=np.float32)
+            for it, iv in splits:
+                inner_count = np.bincount(codes[it], minlength=size)
+                inner_sum = np.bincount(codes[it], weights=y[it], minlength=size)
+                inner_prior = float(y[it].mean())
+                for j, strength in enumerate(self.smoothing):
+                    mapping = (inner_sum + strength * inner_prior) / (inner_count + strength)
+                    oof[iv, j] = mapping[codes[iv]]
+            for j, strength in enumerate(self.smoothing):
+                extras[f"{c}_te{int(strength)}"] = oof[:, j]
+        return pd.concat([base, pd.DataFrame(extras, index=base.index)], axis=1)
+
+    def transform(self, x):
+        base = self.base.transform(x)
+        keys, numeric = self.keys(x)
+        extras = {c: numeric[c].to_numpy() for c in self.numeric_keep}
+        for c in self.keep:
+            levels, frequency, full, prior = self.maps[c]
+            codes = levels.get_indexer(keys[c])
+            known = codes >= 0
+            freq = np.zeros(len(x), dtype=np.float32)
+            freq[known] = frequency[codes[known]]
+            extras[c + "_freq"] = freq
+            for strength, mapping in zip(self.smoothing, full):
+                values = np.full(len(x), prior, dtype=np.float32)
+                values[known] = mapping[codes[known]]
+                extras[f"{c}_te{int(strength)}"] = values
+        return pd.concat([base, pd.DataFrame(extras, index=base.index)], axis=1)
+
+
+def make_features(variant, seed=SEED):
+    return SignalFeatures(variant, seed) if variant in SIGNAL_VARIANTS else Features(variant, seed)
 
 
 def model_frame(x, family):
@@ -223,7 +334,7 @@ def defaults(family):
             reg_lambda=8., subsample=0.85, colsample_bytree=0.85, learning_rate=0.04)
     if family == "lgb":
         return dict(max_depth=6, num_leaves=31, min_child_samples=80, reg_alpha=0.01,
-            reg_lambda=8., subsample=0.85, subsample_freq=1, colsample_bytree=0.85, learning_rate=0.04)
+            reg_lambda=8., subsample=0.85, subsample_freq=1, colsample_bytree=0.85, learning_rate=0.04, max_bin=255)
     return dict(depth=6, learning_rate=0.04, l2_leaf_reg=8., random_strength=1.,
         bootstrap_type="Bayesian", bagging_temperature=1.)
 
@@ -236,13 +347,14 @@ def suggest(trial, family):
             reg_alpha=trial.suggest_float("reg_alpha", 1e-4, 10, log=True),
             reg_lambda=trial.suggest_float("reg_lambda", 1e-2, 30, log=True),
             subsample=trial.suggest_float("subsample", 0.65, 1),
-            colsample_bytree=trial.suggest_float("colsample_bytree", 0.6, 1))
+            colsample_bytree=trial.suggest_float("colsample_bytree", 0.3, 1))
         if family == "xgb":
             p.update(min_child_weight=trial.suggest_float("min_child_weight", 1, 30, log=True),
                      gamma=trial.suggest_float("gamma", 0, 5))
         else:
             p.update(num_leaves=min(2 ** p["max_depth"], trial.suggest_int("num_leaves", 15, 127)),
-                     min_child_samples=trial.suggest_int("min_child_samples", 40, 400))
+                     min_child_samples=trial.suggest_int("min_child_samples", 10, 400),
+                     max_bin=trial.suggest_categorical("max_bin", [255, 511, 1023]))
     else:
         p.update(depth=trial.suggest_int("depth", 4, 8), l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1, 30, log=True),
             random_strength=trial.suggest_float("random_strength", 0.01, 5, log=True),
@@ -259,7 +371,7 @@ def context(args, create=False):
     if create and not cfg_path.exists():
         cfg = dict(seed=SEED, max_rounds=args.max_rounds, early_stopping=args.early_stopping,
             threads=args.threads, xgb_device=args.xgb_device, seeds=args.seeds,
-            holdout_previously_reviewed=args.holdout_already_reviewed,
+            holdout_previously_reviewed=args.holdout_already_reviewed, profile=args.profile,
             hashes=hashes, code_sha256=code_hash, families=args.families,
             versions={p: importlib.metadata.version(p) for p in ("numpy", "pandas", "scikit-learn", "xgboost", "lightgbm", "catboost", "optuna")},
             python=platform.python_version())
@@ -268,14 +380,81 @@ def context(args, create=False):
     if cfg["hashes"] != hashes or cfg["code_sha256"] != code_hash:
         raise ValueError("Data/code changed. Use a fresh run directory; do not reuse a revealed sealed holdout for tuning.")
     if create:
-        for key in ("max_rounds", "early_stopping", "threads", "xgb_device", "seeds", "families"):
+        for key in ("max_rounds", "early_stopping", "threads", "xgb_device", "seeds", "families", "profile"):
             if getattr(args, key) != cfg[key]:
                 raise ValueError(f"Resume configuration changed: {key}")
         if args.holdout_already_reviewed != cfg.get("holdout_previously_reviewed", False):
             raise ValueError("Resume configuration changed: holdout review status")
     y = tr[TARGET].to_numpy(dtype=int)
     dev, sealed, cv, outer = split_plan(y, cfg["seed"])
+    cfg = dict(cfg, _cache_dir=str(run / "cache"))
     return tr, te, sub, id_col, features, run, cfg, y, dev, sealed, cv, outer
+
+
+def frame_digest(x):
+    h = hashlib.sha256()
+    h.update(repr([(str(c), str(t)) for c, t in x.dtypes.items()]).encode())
+    h.update(pd.util.hash_pandas_object(x, index=False).to_numpy().tobytes())
+    return h.hexdigest()
+
+
+def prediction_batch(x, y, xp, candidate, cfg, seeds, valid_y=None, model_dir=None):
+    """Checkpoint each exact fit. Trial numbers and selection metadata are not model inputs."""
+    family, variant = candidate["family"], candidate["variant"]
+    fixed = candidate.get("fixed_rounds") if valid_y is None else None
+    cache_dir = Path(cfg["_cache_dir"]) if cfg.get("_cache_dir") else None
+    signature = None
+    if cache_dir:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        signature = dict(x=frame_digest(x), xp=frame_digest(xp),
+            y=hashlib.sha256(np.asarray(y, dtype=np.int64).tobytes()).hexdigest(),
+            valid_y=None if valid_y is None else hashlib.sha256(np.asarray(valid_y, dtype=np.int64).tobytes()).hexdigest(),
+            family=family, variant=variant, params=candidate["params"], fixed_rounds=fixed,
+            config={k: v for k, v in cfg.items() if not k.startswith("_") and k not in ("seeds", "families", "profile")},
+            implementation=digest(__file__))
+    preds, rounds = [], []
+    prepared = None
+    seed_dependent = variant == "target" or variant in SIGNAL_VARIANTS
+    for seed in seeds:
+        path = meta_path = None
+        if signature is not None:
+            key = hashlib.sha256(json.dumps(dict(signature, model_seed=seed), sort_keys=True).encode()).hexdigest()
+            path, meta_path = cache_dir / f"{key}.npz", cache_dir / f"{key}.json"
+        model_path = Path(model_dir) / f"seed_{seed}.joblib" if model_dir is not None else None
+        if path is not None and path.exists() and meta_path.exists() and (model_path is None or model_path.exists()):
+            meta = read_json(meta_path)
+            if meta["sha256"] != digest(path):
+                raise ValueError(f"Corrupt prediction cache: {path}")
+            with np.load(path, allow_pickle=False) as saved:
+                values = saved["prediction"]
+            if len(values) != len(xp) or not np.isfinite(values).all() or ((values < 0) | (values > 1)).any():
+                raise ValueError(f"Invalid prediction cache: {path}")
+            preds.append(values)
+            rounds.append(int(meta["rounds"]))
+            print(f"  Reused {family}/{variant} seed={seed}", flush=True)
+            continue
+        if prepared is None or seed_dependent:
+            fe = make_features(variant, seed)
+            xt, xv = fe.fit_transform(x, y), fe.transform(xp)
+            prepared = (fe, xt, xv)
+        else:
+            fe, xt, xv = prepared
+        model, n = fit_model(family, candidate["params"], xt, y,
+            None if valid_y is None else (xv, valid_y), seed, cfg, fixed)
+        values = predict(model, xv, family)
+        if model_path is not None:
+            import joblib
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump({"features": fe, "model": model, "family": family}, model_path)
+        if path is not None:
+            temporary = path.with_suffix(".tmp")
+            with temporary.open("wb") as stream:
+                np.savez_compressed(stream, prediction=values)
+            temporary.replace(path)
+            write_json(meta_path, {"rounds": n, "sha256": digest(path)})
+        preds.append(values)
+        rounds.append(n)
+    return np.mean(preds, axis=0), rounds
 
 
 def run_cv(x, y, cv, candidate, cfg, seeds):
@@ -283,15 +462,8 @@ def run_cv(x, y, cv, candidate, cfg, seeds):
     rounds, scores = [], []
     family, variant, params = [candidate[k] for k in ("family", "variant", "params")]
     for fold, (it, iv) in enumerate(cv):
-        preds = []
-        for seed in seeds:
-            fe = Features(variant, seed)
-            xt = fe.fit_transform(x.iloc[it], y[it])
-            xv = fe.transform(x.iloc[iv])
-            model, n = fit_model(family, params, xt, y[it], (xv, y[iv]), seed, cfg)
-            preds.append(predict(model, xv, family))
-            rounds.append(n)
-        oof[iv] = np.mean(preds, axis=0)
+        oof[iv], fold_rounds = prediction_batch(x.iloc[it], y[it], x.iloc[iv], candidate, cfg, seeds, valid_y=y[iv])
+        rounds.extend(fold_rounds)
         scores.append(float(roc_auc_score(y[iv], oof[iv])))
         print(f"  {family}/{variant} fold={fold} AUC={scores[-1]:.6f}", flush=True)
     return oof, rounds, scores
@@ -308,12 +480,17 @@ def search(args):
             load_if_exists=True, direction="maximize", sampler=optuna.samplers.TPESampler(seed=cfg["seed"]))
         # Test encodings at the same baseline parameters before the wider search.
         if not study.trials:
-            for variant in ("raw", "frequency", "target", "interaction"):
-                study.enqueue_trial({"variant": variant, **{k: v for k, v in defaults(family).items() if k not in ("subsample_freq", "bootstrap_type")}})
+            variants = ("raw", *SIGNAL_VARIANTS, "multiscale_dual") if cfg["profile"] == "signals" else ("raw", "frequency", "target", "interaction")
+            for index, variant in enumerate(variants):
+                params = defaults(family)
+                if cfg["profile"] == "signals" and index == 5 and family == "lgb":
+                    params.update(max_depth=5, num_leaves=31, min_child_samples=20,
+                        colsample_bytree=0.5, reg_alpha=0.07, reg_lambda=2., max_bin=511)
+                study.enqueue_trial({"variant": variant, **{k: v for k, v in params.items() if k not in ("subsample_freq", "bootstrap_type")}})
         study.sampler = optuna.samplers.TPESampler(seed=cfg["seed"] + len(study.trials))
         def objective(trial):
             started = time.time()
-            variant = trial.suggest_categorical("variant", ["raw", "frequency", "interaction", "artifact", "target"])
+            variant = trial.suggest_categorical("variant", ["raw", "frequency", "interaction", "artifact", "target", *SIGNAL_VARIANTS])
             candidate = dict(family=family, variant=variant, params=suggest(trial, family), trial=trial.number)
             print(f"Starting {family} trial={trial.number}, features={variant}; search seed={cfg['seed']}", flush=True)
             oof, rounds, scores = run_cv(tr[cols], y, cv, candidate, cfg, [cfg["seed"]])
@@ -399,19 +576,7 @@ def freeze(args):
 
 
 def fitted_predictions(x, y, xpred, candidate, cfg, model_dir=None):
-    values = []
-    family = candidate["family"]
-    for seed in cfg["seeds"]:
-        fe = Features(candidate["variant"], seed)
-        xt = fe.fit_transform(x, y)
-        xp = fe.transform(xpred)
-        model, _ = fit_model(family, candidate["params"], xt, y, None, seed, cfg, candidate["fixed_rounds"])
-        values.append(predict(model, xp, family))
-        if model_dir is not None:
-            import joblib
-            Path(model_dir).mkdir(parents=True, exist_ok=True)
-            joblib.dump({"features": fe, "model": model, "family": family}, Path(model_dir) / f"seed_{seed}.joblib")
-    return np.mean(values, axis=0)
+    return prediction_batch(x, y, xpred, candidate, cfg, cfg["seeds"], model_dir=model_dir)[0]
 
 
 def paired_bootstrap(y, p, baseline, n=300):
@@ -440,9 +605,10 @@ def audit(args):
         return
     write_json(mark, {"frozen_sha256": digest(run / "frozen.json"), "opened_at": time.time()})
     # No sealed labels are supplied to fitting, encoding, early stopping or weight selection.
-    preds = [fitted_predictions(tr[cols].iloc[dev], y[dev], tr[cols].iloc[sealed], c, cfg) for c in frozen["candidates"]]
+    both = pd.concat([tr[cols].iloc[sealed], te[cols]], ignore_index=True)
+    preds = [fitted_predictions(tr[cols].iloc[dev], y[dev], both, c, cfg)[:len(sealed)] for c in frozen["candidates"]]
     p = np.column_stack(preds) @ np.asarray(frozen["weights"])
-    baseline = fitted_predictions(tr[cols].iloc[dev], y[dev], tr[cols].iloc[sealed], frozen["baseline"], cfg)
+    baseline = fitted_predictions(tr[cols].iloc[dev], y[dev], both, frozen["baseline"], cfg)[:len(sealed)]
     report = dict(sealed_auc=float(roc_auc_score(y[sealed], p)),
         baseline_sealed_auc=float(roc_auc_score(y[sealed], baseline)), public_lb=None,
         public_lb_target=0.94635, sealed_rows=len(sealed),
@@ -530,14 +696,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["diagnose", "search", "freeze", "audit", "finalize"])
     parser.add_argument("--data", default="/kaggle/input/competitions/playground-series-s6e9")
-    parser.add_argument("--run", default="runs/tuned_v2")
-    parser.add_argument("--trials", type=int, default=20, help="Total completed trials per family; increase to resume")
-    parser.add_argument("--families", nargs="+", choices=["xgb", "cat", "lgb"], default=["lgb", "xgb"])
-    parser.add_argument("--max-rounds", type=int, default=5000)
-    parser.add_argument("--early-stopping", type=int, default=200)
+    parser.add_argument("--run", default="runs/signals_v3")
+    parser.add_argument("--profile", choices=["signals", "legacy"], default="signals")
+    parser.add_argument("--trials", type=int, default=6, help="Total completed trials per family; increase to resume")
+    parser.add_argument("--families", nargs="+", choices=["xgb", "cat", "lgb"], default=["lgb"])
+    parser.add_argument("--max-rounds", type=int, default=3500)
+    parser.add_argument("--early-stopping", type=int, default=120)
     parser.add_argument("--threads", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--xgb-device", choices=["cpu", "cuda"], default="cpu")
-    parser.add_argument("--seeds", nargs="+", type=int, default=[2026, 42, 3407],
+    parser.add_argument("--seeds", nargs="+", type=int, default=[2026],
                         help="Seeds used after model selection; search always uses the single split seed")
     parser.add_argument("--holdout-already-reviewed", action="store_true",
                         help="Mark a reused holdout as previously reviewed, not fresh independent evidence")
