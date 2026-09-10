@@ -2,4 +2,6 @@
 
 For Kaggle Competittion
 
-Public Score : 0.94625  247 / 1410
+Public Score : 0.94625
+
+247/1410
