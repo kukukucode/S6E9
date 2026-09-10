@@ -64,3 +64,4 @@ def test_encoding_trials_then_three_seed_finalists_and_submission(tmp_path, monk
     monkeypatch.setattr(p, 'fit_model', unexpected_fit)
     execute('finalize')
     assert (run / 'submission.csv').read_bytes() == before
+    assert {f.name for f in run.glob('*.csv')} == {'submission.csv', 'final_oof.csv'}

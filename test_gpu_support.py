@@ -22,11 +22,24 @@ def test_cuda_configuration_keeps_bins_and_excludes_cpu_only_flags(monkeypatch):
     monkeypatch.setattr(lgb, 'LGBMClassifier', Model)
     x = pd.DataFrame({'a': np.arange(20)})
     cfg = dict(max_rounds=4, early_stopping=2, threads=2, lgb_device='cuda', lgb_gpu_id=1)
-    params = dict(p.defaults('lgb'), max_bin=511)
+    params = dict(p.defaults('lgb'), max_bin=255)
     p.fit_model('lgb', params, x, np.tile([0, 1], 10), None, 2026, cfg, 4)
     assert captured['device_type'] == 'cuda' and captured['gpu_device_id'] == 1
-    assert captured['max_bin'] == 511 and captured['num_gpu'] == 1
+    assert captured['max_bin'] == 255 and captured['num_gpu'] == 1
     assert 'deterministic' not in captured and 'force_col_wise' not in captured
+
+
+def test_large_bins_use_cpu_without_changing_model_parameters():
+    rng = np.random.default_rng(42)
+    x = pd.DataFrame(rng.normal(size=(800, 3)), columns=['a', 'b', 'c'])
+    y = (x.a > 0).astype(int).to_numpy()
+    params = dict(p.defaults('lgb'), max_bin=511)
+    cfg = dict(max_rounds=8, early_stopping=3, threads=2, lgb_device='cuda')
+    hybrid, _ = p.fit_model('lgb', params, x, y, None, 2026, cfg, 8)
+    cpu, _ = p.fit_model('lgb', params, x, y, None, 2026, dict(cfg, lgb_device='cpu'), 8)
+    assert hybrid.booster_.params.get('device_type', 'cpu') == 'cpu'
+    assert hybrid.booster_.params['max_bin'] == 511
+    np.testing.assert_array_equal(p.predict(hybrid, x, 'lgb'), p.predict(cpu, x, 'lgb'))
 
 
 def test_cpu_backend_has_identical_predictions_to_measured_version():

@@ -18,6 +18,8 @@ from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 
 TARGET = "Will_Buy_EV"
 SEED = 2026
+LGB_CUDA_BIN_LIMIT = 255
+RECOVERABLE_CUDA_CODE_HASHES = {"b44e9240ab8c59b4a3b790b42d69d6ed12189322ae91f821c79c98b85609031e"}
 
 
 def write_json(path, obj):
@@ -291,6 +293,13 @@ def model_frame(x, family):
     return x
 
 
+def lgb_effective_device(params, cfg):
+    requested = cfg.get("lgb_device", "cpu")
+    if requested == "cuda" and params.get("max_bin", 255) > LGB_CUDA_BIN_LIMIT:
+        return "cpu"
+    return requested
+
+
 def fit_model(family, params, x, y, valid, seed, cfg, rounds=None):
     n = int(rounds or cfg["max_rounds"])
     x = model_frame(x, family)
@@ -305,7 +314,9 @@ def fit_model(family, params, x, y, valid, seed, cfg, rounds=None):
         best = model.best_iteration + 1 if valid else n
     elif family == "lgb":
         import lightgbm as lgb
-        device = cfg.get("lgb_device", "cpu")
+        device = lgb_effective_device(params, cfg)
+        if device != cfg.get("lgb_device", "cpu"):
+            print(f"  LightGBM max_bin={params['max_bin']}: using CPU to avoid the observed CUDA crash; bins unchanged", flush=True)
         backend = (dict(deterministic=True, force_col_wise=True) if device == "cpu" else
                    dict(device_type="cuda", gpu_device_id=cfg.get("lgb_gpu_id", 0), num_gpu=1))
         if device not in ("cpu", "cuda"):
@@ -377,6 +388,7 @@ def context(args, create=False):
         cfg = dict(seed=SEED, max_rounds=args.max_rounds, early_stopping=args.early_stopping,
             threads=args.threads, xgb_device=args.xgb_device, seeds=args.seeds,
             lgb_device=args.lgb_device, lgb_gpu_id=args.lgb_gpu_id,
+            lgb_cuda_bin_limit=LGB_CUDA_BIN_LIMIT,
             holdout_previously_reviewed=args.holdout_already_reviewed, profile=args.profile,
             hashes=hashes, code_sha256=code_hash, families=args.families,
             versions={p: importlib.metadata.version(p) for p in ("numpy", "pandas", "scikit-learn", "xgboost", "lightgbm", "catboost", "optuna")},
@@ -385,6 +397,8 @@ def context(args, create=False):
     cfg = read_json(cfg_path)
     if cfg["hashes"] != hashes or cfg["code_sha256"] != code_hash:
         raise ValueError("Data/code changed. Use a fresh run directory; do not reuse a revealed sealed holdout for tuning.")
+    if cfg.get("lgb_cuda_bin_limit") != LGB_CUDA_BIN_LIMIT:
+        raise ValueError("Backend policy changed. Use a new run or the explicit recover-run command.")
     if create:
         for key in ("max_rounds", "early_stopping", "threads", "xgb_device", "lgb_device", "lgb_gpu_id", "seeds", "families", "profile"):
             if getattr(args, key) != cfg[key]:
@@ -479,7 +493,6 @@ def search(args):
     tr, te, sub, id_col, cols, run, cfg, y, dev, sealed, cv, outer = context(args, True)
     if (run / "frozen.json").exists() or (run / "SEALED_OPENED.json").exists():
         raise RuntimeError("This experiment is frozen; search is disabled.")
-    pd.DataFrame({id_col: tr[id_col], "outer_fold": outer}).to_csv(run / "folds.csv", index=False)
     import optuna
     for family in cfg["families"]:
         study = optuna.create_study(study_name=family, storage=f"sqlite:///{(run / 'optuna.db').resolve().as_posix()}",
@@ -502,18 +515,20 @@ def search(args):
             oof, rounds, scores = run_cv(tr[cols], y, cv, candidate, cfg, [cfg["seed"]])
             name = f"{family}_{trial.number}"
             np.save(run / f"{name}_oof.npy", oof)
-            candidate.update(rounds=rounds, fold_auc=scores, dev_auc=float(roc_auc_score(y[dev], oof[dev])), seconds=time.time() - started)
+            candidate.update(rounds=rounds, fold_auc=scores, dev_auc=float(roc_auc_score(y[dev], oof[dev])), seconds=time.time() - started,
+                actual_device=lgb_effective_device(candidate['params'], cfg) if family == 'lgb' else (cfg.get('xgb_device', 'cpu') if family == 'xgb' else 'cpu'))
             write_json(run / f"{name}.json", candidate)
             trial.set_user_attr("artifact", name)
             return candidate["dev_auc"]
         # trials is a TOTAL completed-trial budget per family, making resume idempotent.
         completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
         study.optimize(objective, n_trials=max(0, args.trials - completed))
-        study.trials_dataframe().to_csv(run / f"{family}_trials.csv", index=False)
     print("Search complete. Sealed scores have NOT been computed.", flush=True)
 
 
 def blend_weights(y, matrix):
+    if matrix.shape[1] == 1:
+        return np.ones(1), float(roc_auc_score(y, matrix[:, 0]))
     # Small greedy convex search: 20 steps, no unconstrained optimizer.
     total = np.zeros(len(y))
     counts = np.zeros(matrix.shape[1])
@@ -566,12 +581,6 @@ def freeze(args):
         np.save(run / f"frozen_candidate_{i}_dev_oof.npy", oof)
     matrix = np.column_stack(matrix)
     weights, score = blend_weights(y[dev], matrix[:, :-1])
-    pd.DataFrame(matrix, columns=[f"candidate_{i}" for i in range(len(all_candidates))]).corr().to_csv(run / "dev_prediction_correlation.csv")
-    report = pd.DataFrame({id_col: tr[id_col].iloc[dev].to_numpy(), TARGET: y[dev]})
-    for i in range(matrix.shape[1]):
-        report[f"candidate_{i}"] = matrix[:, i]
-    report["blend"] = matrix[:, :-1] @ weights
-    report.to_csv(run / "dev_oof.csv", index=False)
     write_json(run / "frozen.json", dict(candidates=candidates, baseline=baseline,
         weights=weights.tolist(), development_selection_auc=score,
         warning=("Development AUC is selection-biased. This holdout was reviewed previously; its audit is not a fresh independent evaluation."
@@ -624,7 +633,6 @@ def audit(args):
               "Public LB is unmeasured. Do not tune using this sealed result."))
     report["delta_vs_baseline"] = report["sealed_auc"] - report["baseline_sealed_auc"]
     report.update(paired_bootstrap(y[sealed], p, baseline))
-    pd.DataFrame({id_col: tr[id_col].iloc[sealed].to_numpy(), TARGET: y[sealed], "prediction": p, "baseline": baseline}).to_csv(run / "sealed_predictions.csv", index=False)
     write_json(run / "sealed_report.json", report)
     print(json.dumps(report, indent=2), flush=True)
 
@@ -692,10 +700,85 @@ def diagnose(args):
         note="AV near 0.5 means this classifier found little shift; it does not prove identical distributions.")
     Path(args.run).mkdir(parents=True, exist_ok=True)
     write_json(Path(args.run) / "diagnostics.json", report)
-    pd.DataFrame({"feature": cols, "importance": model.feature_importances_}).sort_values("importance", ascending=False).to_csv(Path(args.run) / "adversarial_importance.csv", index=False)
-    pd.DataFrame({"dev_missing": tr.iloc[dev][cols].isna().mean(), "test_missing": te[cols].isna().mean(),
-        "dev_unique": tr.iloc[dev][cols].nunique(), "test_unique": te[cols].nunique()}).to_csv(Path(args.run) / "schema_diagnostics.csv")
     print(json.dumps(report, indent=2), flush=True)
+
+
+def recover_run(args):
+    """Copy validated completed v4.1 CUDA trials; requeue interrupted work in a new run."""
+    import shutil
+    import sqlite3
+    import optuna
+    if not args.source_run:
+        raise ValueError("recover-run requires --source-run")
+    source, destination = Path(args.source_run).resolve(), Path(args.run).resolve()
+    if source == destination or source in destination.parents or destination in source.parents:
+        raise ValueError("Recovery needs a separate sibling run directory")
+    old = read_json(source / 'config.json')
+    if destination.exists():
+        manifest = destination / 'recovery.json'
+        if manifest.exists() and read_json(manifest)['source_config_sha256'] == digest(source / 'config.json') and read_json(destination / 'config.json')['code_sha256'] == digest(__file__):
+            print('Recovery already complete; existing destination retained.', flush=True)
+            return
+        raise ValueError("Recovery destination already exists; it will not be overwritten")
+    if old['code_sha256'] not in RECOVERABLE_CUDA_CODE_HASHES:
+        raise ValueError("Only the known v4.1 source can be recovered without retraining")
+    if old.get('lgb_device') != 'cuda' or old['families'] != ['lgb'] or old.get('profile') != 'signals' or old['seeds'] != [old['seed']]:
+        raise ValueError("Recovery supports the single-seed LightGBM signals CUDA run")
+    if any((source / name).exists() for name in ('frozen.json', 'SEALED_OPENED.json', 'sealed_report.json')):
+        raise ValueError("Cannot recover search after candidate freeze or holdout review")
+    hashes = {name: digest(Path(args.data) / name) for name in old['hashes']}
+    if hashes != old['hashes'] or any(importlib.metadata.version(name) != version for name, version in old['versions'].items()):
+        raise ValueError("Recovery data/library versions differ from the completed trials")
+    tr, _, _, _, _ = load_data(args.data)
+    y = tr[TARGET].to_numpy(dtype=int)
+    dev, sealed, cv, _ = split_plan(y, old['seed'])
+    records = []
+    for path in sorted(source.glob('lgb_[0-9]*.json')):
+        record = read_json(path)
+        if record['family'] != 'lgb' or record['params'].get('max_bin', 255) > LGB_CUDA_BIN_LIMIT:
+            raise ValueError("Cannot reuse completed trials whose effective backend changes")
+        pred_path = source / f"lgb_{record['trial']}_oof.npy"
+        oof = np.load(pred_path, allow_pickle=False)
+        if oof.shape != y.shape or not np.isnan(oof[sealed]).all() or not np.isfinite(oof[dev]).all() or ((oof[dev] < 0) | (oof[dev] > 1)).any():
+            raise ValueError("Invalid recovered OOF or holdout contamination")
+        if len(record['rounds']) != len(cv) or not np.isclose(roc_auc_score(y[dev], oof[dev]), record['dev_auc'], atol=1e-12, rtol=0):
+            raise ValueError("Recovered OOF does not match its score/rounds")
+        records.append((path, pred_path, record))
+    if not records:
+        raise ValueError("No completed trial artifacts to recover")
+    destination.mkdir(parents=True)
+    # SQLite backup is consistent and leaves the original experiment unchanged.
+    with sqlite3.connect((source / 'optuna.db').as_uri() + '?mode=ro', uri=True) as src_db:
+        with sqlite3.connect(destination / 'optuna.db') as dst_db:
+            src_db.backup(dst_db)
+    study = optuna.load_study(study_name='lgb', storage=f"sqlite:///{(destination / 'optuna.db').as_posix()}")
+    complete = {t.number: t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE}
+    if set(complete) != {r['trial'] for _, _, r in records}:
+        raise ValueError("Trial database and completed artifacts disagree")
+    for path, pred_path, record in records:
+        trial = complete[record['trial']]
+        if not np.isclose(trial.value, record['dev_auc'], atol=1e-12, rtol=0) or trial.params.get('variant') != record['variant'] or any(record['params'].get(k) != v for k, v in trial.params.items() if k != 'variant'):
+            raise ValueError("Trial parameters do not match saved predictions")
+        shutil.copyfile(path, destination / path.name)
+        shutil.copyfile(pred_path, destination / pred_path.name)
+    retried = []
+    for trial in study.trials:
+        if trial.state == optuna.trial.TrialState.RUNNING:
+            fixed = trial.system_attrs.get('fixed_params', {})
+            retry_params = dict(fixed, **trial.params)
+            if not retry_params:
+                raise ValueError("Interrupted trial has no parameters to retry")
+            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+            study.enqueue_trial(retry_params)
+            retried.append(trial.number)
+    new = dict(old, code_sha256=digest(__file__), lgb_cuda_bin_limit=LGB_CUDA_BIN_LIMIT)
+    if (source / 'diagnostics.json').is_file():
+        shutil.copyfile(source / 'diagnostics.json', destination / 'diagnostics.json')
+    write_json(destination / 'config.json', new)
+    write_json(destination / 'recovery.json', dict(source_config_sha256=digest(source / 'config.json'),
+        copied_trials=sorted(complete), retried_trials=retried, source_run=str(source),
+        note='Only completed <=255-bin CUDA trials were retained; >255-bin fits now use CPU.'))
+    print(f"Recovered {len(complete)} completed trials without retraining; requeued {retried}. Source retained.", flush=True)
 
 
 def check_device(args):
@@ -707,10 +790,10 @@ def check_device(args):
     x["category"] = pd.Categorical(rng.integers(0, 4, len(x)))
     y = (x.f0.to_numpy() + x.f1.to_numpy() + rng.normal(size=len(x)) > 0).astype(int)
     params = defaults("lgb")
-    params.update(max_bin=511, min_child_samples=20)
+    params.update(max_bin=LGB_CUDA_BIN_LIMIT, min_child_samples=20)
     cfg = dict(max_rounds=4, early_stopping=2, threads=args.threads,
                lgb_device=args.lgb_device, lgb_gpu_id=args.lgb_gpu_id)
-    print("CHECK_STAGE: fit begin (max_bin=511, categories, bagging, validation)", flush=True)
+    print("CHECK_STAGE: fit begin (max_bin=255, categories, bagging, validation)", flush=True)
     model, _ = fit_model("lgb", params, x.iloc[:3072], y[:3072], (x.iloc[3072:], y[3072:]), SEED, cfg)
     print("CHECK_STAGE: fit completed; predict begin", flush=True)
     predict(model, x.iloc[3072:], "lgb")
@@ -718,12 +801,13 @@ def check_device(args):
     actual = model.booster_.params.get("device_type", "cpu")
     if actual != args.lgb_device:
         raise RuntimeError(f"Requested {args.lgb_device}, but got {actual}")
-    print(f"LightGBM backend check passed: {actual}, max_bin=511, categorical features enabled", flush=True)
+    print(f"LightGBM backend check passed: {actual}, max_bin=255; larger-bin candidates use CPU", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["check-device", "diagnose", "search", "freeze", "audit", "finalize"])
+    parser.add_argument("command", choices=["recover-run", "check-device", "diagnose", "search", "freeze", "audit", "finalize"])
+    parser.add_argument("--source-run", help="Stopped v4.1 run to copy with recover-run")
     parser.add_argument("--data", default="/kaggle/input/competitions/playground-series-s6e9")
     parser.add_argument("--run", default="runs/signals_v4")
     parser.add_argument("--profile", choices=["signals", "legacy"], default="signals")
