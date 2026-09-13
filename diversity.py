@@ -1,8 +1,4 @@
-"""Kaggle v5: cached features, isolated GPU folds and development-only micro-blend.
-
-Each command is explicit: search -> freeze -> audit -> finalize.
-The v4 runs are never modified or silently imported into this experiment.
-"""
+"""Cached fold execution and development-only model selection."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +7,6 @@ import importlib.metadata
 import itertools
 import json
 import os
-import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -25,7 +20,7 @@ from scipy.stats import rankdata
 from sklearn.metrics import roc_auc_score
 
 import prototype as p
-from gpu_setup import detect_gpu_ids
+from gpu_setup import require_t4_pair
 
 
 def key(value):
@@ -35,9 +30,9 @@ def key(value):
 def context(args):
     run = Path(args.run)
     settings = dict(seed=args.seed, threads=args.threads, gpu_ids=args.gpu_ids,
-        parallel_folds=args.parallel_folds, max_rounds=args.max_rounds,
+        parallel_folds=2, max_rounds=args.max_rounds,
         early_stopping=args.early_stopping, auc_window=args.auc_window, max_corr=args.max_corr,
-        cache_compression=args.cache_compression, domain_compare=args.domain_compare,
+        domain_compare=args.domain_compare,
         hashes={f: p.digest(Path(args.data) / f) for f in ('train.csv', 'test.csv', 'sample_submission.csv')},
         sources={f: p.digest(Path(__file__).with_name(f)) for f in ('prototype.py', 'diversity.py', 'gpu_setup.py')},
         versions={name: importlib.metadata.version(name) for name in
@@ -52,7 +47,21 @@ def context(args):
         raise ValueError('Run search first with the same settings.')
     tr, te, sub, id_col, cols = p.load_data(args.data)
     y = tr[p.TARGET].to_numpy(dtype=int)
-    return run, settings, tr, te, sub, id_col, cols, y, p.split_plan(y, args.seed)
+    split = p.split_plan(y, args.seed)
+    data_path = run / 'cache' / 'data' / (key(dict(hashes=settings['hashes'], seed=args.seed,
+        versions=settings['versions'], source=settings['sources']['prototype.py'])) + '.joblib')
+    meta_path = data_path.with_suffix('.json')
+    if data_path.exists() and meta_path.exists():
+        if p.read_json(meta_path)['sha256'] != p.digest(data_path):
+            raise ValueError(f'Corrupt worker data cache: {data_path}')
+    else:
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = data_path.with_suffix('.tmp')
+        joblib.dump((tr, te, id_col, cols, y, split), temporary, compress=0)
+        temporary.replace(data_path)
+        p.write_json(meta_path, dict(sha256=p.digest(data_path), bytes=data_path.stat().st_size))
+    args._data = (tr, te, sub, id_col, cols, y, split)
+    return run, dict(settings, _data_cache=str(data_path.resolve())), tr, te, sub, id_col, cols, y, split
 
 
 def anchor():
@@ -88,88 +97,71 @@ def suggest(trial, lane):
         variant='multiscale_dual', params=params, device='cuda')
 
 
-def checked_npz(path):
+def checked_prediction(path):
     meta = p.read_json(path.with_suffix('.json'))
     if p.digest(path) != meta['sha256']:
         raise ValueError(f'Corrupt prediction cache: {path}')
-    with np.load(path, allow_pickle=False) as blob:
-        pred = blob['prediction']
+    pred = np.load(path, allow_pickle=False)
     if not np.isfinite(pred).all() or not ((pred >= 0) & (pred <= 1)).all():
         raise ValueError(f'Invalid probabilities: {path}')
     return pred, meta
 
 
-def cache_compression(requested, matrices, folder):
-    estimated = sum(int(x.memory_usage(index=True, deep=True).sum()) for x in matrices)
-    free = shutil.disk_usage(folder).free
-    reserve = 512 * 1024 ** 2
-    if free < reserve:
-        raise RuntimeError('Feature cache disk space is low. Save outputs and free space before resuming.')
-    # Budget for two workers writing concurrently. Compression only changes storage.
-    return 3 if requested == 0 and free < estimated * 3 + reserve else requested
-
-
 def worker(path):
-    """One fresh process sees at most one GPU, selected before importing ML libraries."""
+    """Load binary data once and process all folds assigned to this device."""
     job = p.read_json(path)
-    started = time.perf_counter()
     cfg, candidate = job['config'], job['candidate']
-    tr, te, _, _, cols = p.load_data(job['data'])
-    y = tr[p.TARGET].to_numpy(dtype=int)
-    _, _, cv, outer = p.split_plan(y, cfg['seed'])
-    fold, phase = job['fold'], job['phase']
-    if phase == 'dev':
-        it, iv = cv[fold]
-        xp = tr[cols].iloc[iv]
-    else:
-        it, iv = np.flatnonzero(outer != fold), np.flatnonzero(outer == fold)
-        xp = pd.concat([tr[cols].iloc[iv], te[cols]], ignore_index=True)
-    xt = tr[cols].iloc[it]
-    # Deliberately independent of family, parameters, device and trial number.
-    # Labels/row order/versions/code/split are part of the identity via config.
-    identity = dict(hashes=cfg['hashes'], sources=cfg['sources'], versions=cfg['versions'],
-        seed=cfg['seed'], variant=candidate['variant'], phase=phase, fold=fold)
-    cache = Path(job['run']) / 'cache' / 'features' / (key(identity) + '.joblib')
-    meta_path = cache.with_suffix('.json')
-    cache_hit = cache.exists() and meta_path.exists()
-    if cache_hit:
-        if p.read_json(meta_path)['sha256'] != p.digest(cache):
-            raise ValueError(f'Corrupt feature cache: {cache}')
-        # These are our own locally produced caches, never downloaded pickle inputs.
-        train_x, pred_x = joblib.load(cache)
-        print(f'Reused features: {candidate["variant"]}/{phase}/{fold}', flush=True)
-    else:
-        fe = p.make_features(candidate['variant'], cfg['seed'])
-        train_x, pred_x = fe.fit_transform(xt, y[it]), fe.transform(xp)
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        temporary = cache.with_suffix('.tmp')
-        compression = cache_compression(cfg.get('cache_compression', 0), (train_x, pred_x), cache.parent)
-        joblib.dump((train_x, pred_x), temporary, compress=compression)
-        temporary.replace(cache)
-        p.write_json(meta_path, dict(sha256=p.digest(cache), compression=compression, bytes=cache.stat().st_size))
-        del fe
-    valid = (pred_x, y[iv]) if phase == 'dev' else None
-    fixed = candidate.get('fixed_rounds') if phase != 'dev' else None
-    backend = dict(max_rounds=cfg['max_rounds'], early_stopping=cfg['early_stopping'],
-        threads=job['threads'], lgb_device=candidate['device'], lgb_gpu_id=0,
-        xgb_device='cuda:0' if candidate['device'] == 'cuda' else 'cpu')
-    prepared_at = time.perf_counter()
-    model, rounds = p.fit_model(candidate['family'], candidate['params'], train_x, y[it],
-        valid, cfg['seed'], backend, fixed)
-    if candidate['family'] == 'xgb' and candidate['device'] == 'cuda':
-        actual = json.loads(model.get_booster().save_config())['learner']['generic_param']['device']
-        if not actual.startswith('cuda'):
-            raise RuntimeError(f'XGBoost did not use the requested GPU: {actual}')
-    prediction = p.predict(model, pred_x, candidate['family'])
-    output = Path(job['output'])
-    temporary = output.with_suffix('.tmp')
-    with temporary.open('wb') as stream:
-        np.savez_compressed(stream, prediction=prediction)
-    temporary.replace(output)
-    p.write_json(output.with_suffix('.json'), dict(sha256=p.digest(output), rounds=max(1, int(rounds)),
-        validation_rows=len(iv), test_rows=0 if phase == 'dev' else len(te), feature_cache_hit=cache_hit,
-        prepare_seconds=prepared_at-started, fit_predict_seconds=time.perf_counter()-prepared_at,
-        feature_cache_bytes=cache.stat().st_size))
+    tr, te, _, cols, y, (_, _, cv, outer) = joblib.load(cfg['_data_cache'])
+    phase = job['phase']
+    for fold in job['folds']:
+        started = time.perf_counter()
+        if phase == 'dev':
+            it, iv = cv[fold]
+            xp = tr[cols].iloc[iv]
+        else:
+            it, iv = np.flatnonzero(outer != fold), np.flatnonzero(outer == fold)
+            xp = pd.concat([tr[cols].iloc[iv], te[cols]], ignore_index=True)
+        xt = tr[cols].iloc[it]
+        identity = dict(hashes=cfg['hashes'], sources=cfg['sources'], versions=cfg['versions'],
+            seed=cfg['seed'], variant=candidate['variant'], phase=phase, fold=fold)
+        cache = Path(job['run']) / 'cache' / 'features' / (key(identity) + '.joblib')
+        meta_path = cache.with_suffix('.json')
+        cache_hit = cache.exists() and meta_path.exists()
+        if cache_hit:
+            if p.read_json(meta_path)['sha256'] != p.digest(cache):
+                raise ValueError(f'Corrupt feature cache: {cache}')
+            train_x, pred_x = joblib.load(cache)
+            print(f'Reused features: {candidate["variant"]}/{phase}/{fold}', flush=True)
+        else:
+            fe = p.make_features(candidate['variant'], cfg['seed'])
+            train_x, pred_x = fe.fit_transform(xt, y[it]), fe.transform(xp)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            temporary = cache.with_suffix('.tmp')
+            joblib.dump((train_x, pred_x), temporary, compress=0)
+            temporary.replace(cache)
+            p.write_json(meta_path, dict(sha256=p.digest(cache), compression=0, bytes=cache.stat().st_size))
+        valid = (pred_x, y[iv]) if phase == 'dev' else None
+        fixed = candidate.get('fixed_rounds') if phase != 'dev' else None
+        backend = dict(max_rounds=cfg['max_rounds'], early_stopping=cfg['early_stopping'],
+            threads=job['threads'], lgb_device=candidate['device'], lgb_gpu_id=0,
+            xgb_device='cuda:0' if candidate['device'] == 'cuda' else 'cpu')
+        prepared_at = time.perf_counter()
+        model, rounds = p.fit_model(candidate['family'], candidate['params'], train_x, y[it],
+            valid, cfg['seed'], backend, fixed)
+        if candidate['family'] == 'xgb' and candidate['device'] == 'cuda':
+            actual = json.loads(model.get_booster().save_config())['learner']['generic_param']['device']
+            if not actual.startswith('cuda'):
+                raise RuntimeError(f'XGBoost did not use the requested GPU: {actual}')
+        prediction = p.predict(model, pred_x, candidate['family'])
+        output = Path(job['outputs'][str(fold)])
+        temporary = output.with_suffix('.tmp')
+        with temporary.open('wb') as stream:
+            np.save(stream, prediction, allow_pickle=False)
+        temporary.replace(output)
+        p.write_json(output.with_suffix('.json'), dict(sha256=p.digest(output), rounds=max(1, int(rounds)),
+            validation_rows=len(iv), test_rows=0 if phase == 'dev' else len(te), feature_cache_hit=cache_hit,
+            prepare_seconds=prepared_at-started, fit_predict_seconds=time.perf_counter()-prepared_at,
+            feature_cache_bytes=cache.stat().st_size))
 
 
 def folds(args, cfg, candidate, phase, requested):
@@ -178,69 +170,71 @@ def folds(args, cfg, candidate, phase, requested):
     cache.mkdir(parents=True, exist_ok=True)
     jobs = run / 'cache' / 'jobs'
     jobs.mkdir(parents=True, exist_ok=True)
-    width = min(args.parallel_folds, len(args.gpu_ids), args.threads) if candidate['device'] == 'cuda' else 1
     results = {}
-    tr, _, _, _, _ = p.load_data(args.data)
-    y = tr[p.TARGET].to_numpy(dtype=int)
-    _, _, cv, _ = p.split_plan(y, args.seed)
-    del tr
-    for offset in range(0, len(requested), width):
-        batch, processes = requested[offset:offset + width], []
-        try:
-            for slot, fold in enumerate(batch):
-                spec = {k: candidate[k] for k in ('family', 'variant', 'params', 'device')}
-                if phase != 'dev':
-                    spec['fixed_rounds'] = candidate['fixed_rounds']
-                threads = max(1, args.threads // width)
-                tag = key(dict(config=cfg, candidate=spec, phase=phase, fold=fold, threads=threads))
-                output = cache / f'{tag}.npz'
-                if output.exists() and output.with_suffix('.json').exists():
-                    results[fold] = checked_npz(output)
-                    print(f'Reused predictions: {candidate["name"]}/{phase}/fold {fold}', flush=True)
-                    continue
-                job = jobs / f'{tag}.json'
-                p.write_json(job, dict(config=cfg, candidate=candidate, phase=phase, fold=fold,
-                    threads=threads, run=str(run.resolve()), data=str(Path(args.data).resolve()), output=str(output.resolve())))
-                env = dict(os.environ, OMP_NUM_THREADS=str(threads), OPENBLAS_NUM_THREADS=str(threads),
-                    PYTHONFAULTHANDLER='1', PYTHONUNBUFFERED='1',
-                    CUDA_VISIBLE_DEVICES=str(args.gpu_ids[slot]) if candidate['device'] == 'cuda' else '')
-                log_path = jobs / f'{tag}.log'
-                device_label = f'GPU {args.gpu_ids[slot]}' if candidate['device'] == 'cuda' else 'CPU'
-                print(f'Starting {candidate["name"]}/{phase}/fold {fold} on {device_label}; log={log_path}', flush=True)
-                log = log_path.open('w', encoding='utf8')
-                try:
-                    proc = subprocess.Popen([sys.executable, '-X', 'faulthandler', '-u', str(Path(__file__).resolve()),
-                        'worker', '--job', str(job.resolve())], stdout=log, stderr=subprocess.STDOUT, env=env)
-                except BaseException:
-                    log.close()
-                    raise
-                processes.append((fold, proc, log, log_path, output))
-            for fold, proc, log, log_path, output in processes:
-                code = proc.wait()
+    y, (_, _, cv, _) = args._data[5], args._data[6]
+    spec = {k: candidate[k] for k in ('family', 'variant', 'params', 'device')}
+    if phase != 'dev':
+        spec['fixed_rounds'] = candidate['fixed_rounds']
+    threads = args.threads if candidate['device'] == 'cpu' else max(1, args.threads // 2)
+    pending, outputs = [], {}
+    for fold in requested:
+        tag = key(dict(config=cfg, candidate=spec, phase=phase, fold=fold, threads=threads))
+        output = cache / f'{tag}.npy'
+        outputs[fold] = output
+        if output.exists() and output.with_suffix('.json').exists():
+            results[fold] = checked_prediction(output)
+            print(f'Reused predictions: {candidate["name"]}/{phase}/fold {fold}', flush=True)
+        else:
+            pending.append(fold)
+    groups = ([pending] if candidate['device'] == 'cpu' else
+              [[fold for fold in pending if fold % 2 == slot] for slot in range(2)])
+    processes = []
+    try:
+        for slot, assigned in enumerate(groups):
+            if not assigned:
+                continue
+            selector = '' if candidate['device'] == 'cpu' else str(args.gpu_ids[slot])
+            tag = key(dict(candidate=spec, phase=phase, folds=assigned, selector=selector, threads=threads))
+            job = jobs / f'{tag}.json'
+            p.write_json(job, dict(config=cfg, candidate=candidate, phase=phase, folds=assigned,
+                threads=threads, run=str(run.resolve()), outputs={str(f): str(outputs[f].resolve()) for f in assigned}))
+            env = dict(os.environ, OMP_NUM_THREADS=str(threads), OPENBLAS_NUM_THREADS=str(threads),
+                PYTHONFAULTHANDLER='1', PYTHONUNBUFFERED='1', CUDA_VISIBLE_DEVICES=selector)
+            log_path = jobs / f'{tag}.log'
+            device_label = 'CPU' if candidate['device'] == 'cpu' else f'GPU {selector}'
+            print(f'Starting {candidate["name"]}/{phase}/folds {assigned} on {device_label}; log={log_path}', flush=True)
+            log = log_path.open('w', encoding='utf8')
+            try:
+                proc = subprocess.Popen([sys.executable, '-X', 'faulthandler', '-u', str(Path(__file__).resolve()),
+                    'worker', '--job', str(job.resolve())], stdout=log, stderr=subprocess.STDOUT, env=env)
+            except BaseException:
                 log.close()
-                if code:
-                    tail = log_path.read_text(encoding='utf8', errors='replace')[-5000:]
-                    raise RuntimeError(f'{candidate["name"]}/{phase}/fold {fold} failed ({code}). Log: {log_path}\n{tail}')
-                results[fold] = checked_npz(output)
-        finally:
-            for _, proc, log, _, _ in processes:
-                if proc.poll() is None:
-                    proc.terminate()
-                    proc.wait()
-                log.close()
-        for fold in batch:
-            pred, _ = results[fold]
-            if phase == 'dev':
-                score = float(roc_auc_score(y[cv[fold][1]], pred))
-                print(f'{candidate["name"]} fold={fold} AUC={score:.7f}', flush=True)
+                raise
+            processes.append((assigned, proc, log, log_path))
+        for assigned, proc, log, log_path in processes:
+            code = proc.wait()
+            log.close()
+            if code:
+                tail = log_path.read_text(encoding='utf8', errors='replace')[-5000:]
+                raise RuntimeError(f'{candidate["name"]}/{phase}/folds {assigned} failed ({code}). Log: {log_path}\n{tail}')
+            for fold in assigned:
+                results[fold] = checked_prediction(outputs[fold])
+    finally:
+        for _, proc, log, _ in processes:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait()
+            log.close()
+    for fold in requested:
+        if phase == 'dev':
+            score = float(roc_auc_score(y[cv[fold][1]], results[fold][0]))
+            print(f'{candidate["name"]} fold={fold} AUC={score:.7f}', flush=True)
     return results
 
 
 def evaluate(args, cfg, candidate):
     result = folds(args, cfg, candidate, 'dev', list(range(4)))
-    tr, _, _, _, _ = p.load_data(args.data)
-    y = tr[p.TARGET].to_numpy(dtype=int)
-    dev, _, cv, _ = p.split_plan(y, args.seed)
+    y, (dev, _, cv, _) = args._data[5], args._data[6]
     oof = np.full(len(y), np.nan)
     for fold, (_, iv) in enumerate(cv):
         oof[iv] = result[fold][0]
@@ -437,12 +431,10 @@ def main():
     parser.add_argument('command', choices=['search', 'freeze', 'audit', 'finalize', 'worker'])
     parser.add_argument('--job')
     parser.add_argument('--data', default='/kaggle/input/competitions/playground-series-s6e9')
-    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_1')
+    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_2')
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--threads', type=int, default=4, help='Total CPU budget across concurrent folds')
-    parser.add_argument('--gpu-ids', nargs='+', default=None, help='Physical GPU IDs/UUIDs; default auto-detect up to two')
-    parser.add_argument('--parallel-folds', type=int, choices=[1, 2], default=None)
-    parser.add_argument('--cache-compression', type=int, choices=[0, 3], default=0)
+    parser.add_argument('--gpu-ids', nargs='+', default=None, help='Two physical T4 IDs/UUIDs; default auto-detect')
     parser.add_argument('--domain-compare', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--max-rounds', type=int, default=3500)
     parser.add_argument('--early-stopping', type=int, default=120)
@@ -460,12 +452,7 @@ def main():
         parser.error('Invalid budgets')
     if not 0 < args.max_corr <= 1 or args.auc_window < 0 or args.auc_window > 1:
         parser.error('Invalid candidate filtering thresholds')
-    if args.gpu_ids is None:
-        args.gpu_ids = detect_gpu_ids()
-    if args.parallel_folds is None:
-        args.parallel_folds = min(2, len(args.gpu_ids), args.threads)
-    if any(not (s.isdigit() or s.startswith(('GPU-', 'MIG-'))) for s in args.gpu_ids) or len(set(args.gpu_ids)) != len(args.gpu_ids):
-        parser.error('GPU selectors must be unique nonnegative IDs or UUIDs')
+    args.gpu_ids = require_t4_pair(args.gpu_ids)
     globals()[args.command](args)
 
 

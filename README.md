@@ -1,9 +1,7 @@
-## Predicting Electric Vehicle Purchases
+# S6E9
 
-For Kaggle Competittion
+KaggleのNotebookで `S6E9_Prototype.ipynb` をImportし、コンペデータ・Internet・`GPU T4 x2`を有効にしてRun Allします。提出用CSVは `/kaggle/working/submission.csv` に生成されます。
 
-Public Score : 0.94625
+探索条件は4-fold、seed 2026、LightGBM 12 trials、XGBoost 6 trialsです。T4を1枚ずつ分離した2プロセスでfoldを処理し、CPUモデルは1プロセスで4 foldを処理します。
 
-Rank : 247/1410
-
-The code in `prototype.py` has not been split up to make it easier to work with on Kaggle.
+CIはUbuntu・Python 3.12で構文チェックと全pytestを実行します。GPU実機はCIに含めず、GPU割り当てはモックテストで確認します。

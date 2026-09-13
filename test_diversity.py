@@ -41,8 +41,13 @@ def test_features_reused_across_model_families_but_not_seeds(tmp_path, monkeypat
     frame.iloc[:400].to_csv(data / 'train.csv', index=False)
     frame.iloc[400:].drop(columns=d.p.TARGET).to_csv(data / 'test.csv', index=False)
     pd.DataFrame({'id': np.arange(400, 500), d.p.TARGET: .5}).to_csv(data / 'sample_submission.csv', index=False)
+    binary = run / 'data.joblib'
+    loaded = d.p.load_data(data)
+    y = loaded[0][d.p.TARGET].to_numpy(dtype=int)
+    d.joblib.dump((loaded[0], loaded[1], loaded[3], loaded[4], y, d.p.split_plan(y)), binary, compress=0)
     cfg = dict(seed=2026, hashes={f.name: d.p.digest(f) for f in data.iterdir()},
-        sources={'implementation': 'fixture'}, versions={'fixture': '1'}, max_rounds=3, early_stopping=1)
+        sources={'implementation': 'fixture'}, versions={'fixture': '1'}, max_rounds=3,
+        early_stopping=1, _data_cache=str(binary))
     calls, fits = [], []
     make = d.p.make_features
     def counted(variant, seed):
@@ -55,19 +60,25 @@ def test_features_reused_across_model_families_but_not_seeds(tmp_path, monkeypat
     monkeypatch.setattr(d.p, 'fit_model', fit)
     monkeypatch.setattr(d.p, 'predict', lambda model, x, family: np.full(len(x), .5))
     for i, (family, seed) in enumerate([('lgb', 2026), ('xgb', 2026), ('lgb', 42)]):
-        job = dict(config=dict(cfg, seed=seed), candidate=dict(name=str(i), family=family,
-            variant='multiscale_dual', params={}, device='cpu'), data=str(data), run=str(run),
-            phase='dev', fold=0, threads=1, output=str(run / f'pred_{i}.npz'))
+        if seed != 2026:
+            split = d.p.split_plan(y, seed)
+            seed_binary = run / f'data_{seed}.joblib'
+            d.joblib.dump((loaded[0], loaded[1], loaded[3], loaded[4], y, split), seed_binary, compress=0)
+        else:
+            seed_binary = binary
+        job = dict(config=dict(cfg, seed=seed, _data_cache=str(seed_binary)), candidate=dict(name=str(i), family=family,
+            variant='multiscale_dual', params={}, device='cpu'), run=str(run),
+            phase='dev', folds=[0], threads=1, outputs={'0': str(run / f'pred_{i}.npy')})
         path = run / 'job.json'
         d.p.write_json(path, job)
         d.worker(path)
     assert calls == [('multiscale_dual', 2026), ('multiscale_dual', 42)]
     pd.testing.assert_frame_equal(fits[0][0], fits[1][0])
     pd.testing.assert_frame_equal(fits[0][1], fits[1][1])
-    path = run / 'pred_0.npz'
+    path = run / 'pred_0.npy'
     path.write_bytes(b'corrupt')
     with pytest.raises(ValueError, match='Corrupt prediction cache'):
-        d.checked_npz(path)
+        d.checked_prediction(path)
 
 
 @pytest.mark.parametrize('visible, expected', [
@@ -96,22 +107,31 @@ def test_one_or_two_gpus_are_detected_using_uuids(monkeypatch, count):
     assert g.detect_gpu_ids() == [f'GPU-{i}' for i in range(min(count, 2))]
 
 
-def test_cache_storage_modes_preserve_values_and_categories(tmp_path, monkeypatch):
+def test_t4_pair_is_required_and_validated(monkeypatch):
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
+    outputs = [
+        'GPU-a\nGPU-b\n',
+        '0, GPU-a, Tesla T4\n1, GPU-b, Tesla T4\n',
+    ]
+    monkeypatch.setattr(g.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout=outputs.pop(0)))
+    assert g.require_t4_pair() == ['GPU-a', 'GPU-b']
+    monkeypatch.setattr(g.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout='0, GPU-a, Tesla T4\n'))
+    with pytest.raises(RuntimeError, match='exactly two'):
+        g.require_t4_pair(['GPU-a'])
+    monkeypatch.setattr(g.subprocess, 'run', lambda *a, **kw: SimpleNamespace(
+        stdout='0, GPU-a, Tesla T4\n1, GPU-b, NVIDIA P100\n'))
+    with pytest.raises(RuntimeError, match='requires T4 x2'):
+        g.require_t4_pair(['GPU-a', 'GPU-b'])
+
+
+def test_uncompressed_feature_cache_preserves_values_and_categories(tmp_path):
     x = pd.DataFrame({'value': np.array([.1, np.nan, .3], dtype=np.float32),
         'cat': pd.Categorical(['a', 'b', 'a'], categories=['a', 'b', 'unseen'])})
-    for compression in (0, 3):
-        path = tmp_path / f'cache_{compression}.joblib'
-        d.joblib.dump((x, x), path, compress=compression)
-        train, valid = d.joblib.load(path)
-        pd.testing.assert_frame_equal(train, x)
-        pd.testing.assert_frame_equal(valid, x)
-    monkeypatch.setattr(d.shutil, 'disk_usage', lambda _: SimpleNamespace(free=2 * 1024 ** 3))
-    assert d.cache_compression(0, (x, x), tmp_path) == 0
-    monkeypatch.setattr(d.shutil, 'disk_usage', lambda _: SimpleNamespace(free=512 * 1024 ** 2 + 1))
-    assert d.cache_compression(0, (x, x), tmp_path) == 3
-    monkeypatch.setattr(d.shutil, 'disk_usage', lambda _: SimpleNamespace(free=100))
-    with pytest.raises(RuntimeError, match='disk space'):
-        d.cache_compression(0, (x, x), tmp_path)
+    path = tmp_path / 'cache.joblib'
+    d.joblib.dump((x, x), path, compress=0)
+    train, valid = d.joblib.load(path)
+    pd.testing.assert_frame_equal(train, x)
+    pd.testing.assert_frame_equal(valid, x)
 
 
 def test_two_gpu_folds_are_isolated_and_complete_predictions_are_reused(tmp_path, monkeypatch):
@@ -126,10 +146,11 @@ def test_two_gpu_folds_are_isolated_and_complete_predictions_are_reused(tmp_path
             active.append(self)
             assert len([p for p in active if p.code is None]) <= 2
             job = d.p.read_json(command[-1])
-            calls.append((job['fold'], env['CUDA_VISIBLE_DEVICES'], job['threads']))
-            output = Path(job['output'])
-            np.savez_compressed(output, prediction=np.full(len(cv[job['fold']][1]), .5))
-            d.p.write_json(output.with_suffix('.json'), dict(sha256=d.p.digest(output), rounds=3))
+            calls.append((job['folds'], env['CUDA_VISIBLE_DEVICES'], job['threads']))
+            for fold in job['folds']:
+                output = Path(job['outputs'][str(fold)])
+                np.save(output, np.full(len(cv[fold][1]), .5), allow_pickle=False)
+                d.p.write_json(output.with_suffix('.json'), dict(sha256=d.p.digest(output), rounds=3))
         def wait(self):
             self.code = 0
             return 0
@@ -138,13 +159,18 @@ def test_two_gpu_folds_are_isolated_and_complete_predictions_are_reused(tmp_path
         def terminate(self):
             self.code = -15
     monkeypatch.setattr(d.subprocess, 'Popen', Process)
-    args = Namespace(run=str(tmp_path), data='unused', parallel_folds=2, gpu_ids=['GPU-a', 'GPU-b'], threads=4, seed=2026)
+    args = Namespace(run=str(tmp_path), data='unused', gpu_ids=['GPU-a', 'GPU-b'], threads=4, seed=2026,
+        _data=(None, None, None, None, None, y, d.p.split_plan(y)))
     candidate = dict(d.anchor(), device='cuda', params=dict(d.anchor()['params'], max_bin=255))
     first = d.folds(args, {}, candidate, 'dev', [0, 1, 2, 3])
     second = d.folds(args, {}, candidate, 'dev', [0, 1, 2, 3])
-    assert calls == [(0, 'GPU-a', 2), (1, 'GPU-b', 2), (2, 'GPU-a', 2), (3, 'GPU-b', 2)]
+    assert calls == [([0, 2], 'GPU-a', 2), ([1, 3], 'GPU-b', 2)]
     for fold in range(4):
         np.testing.assert_array_equal(first[fold][0], second[fold][0])
+    calls.clear()
+    cpu = d.anchor()
+    d.folds(args, {}, cpu, 'dev', [0, 1, 2, 3])
+    assert calls == [([0, 1, 2, 3], '', 4)]
 
 
 def test_domain_can_be_primary_but_original_anchor_remains_audit_baseline(tmp_path, monkeypatch):

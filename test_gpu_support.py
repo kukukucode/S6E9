@@ -107,8 +107,10 @@ def test_notebook_embeds_sources_and_passes_gpu_options():
     assert literals == [(root / name).read_text(encoding='utf8') for name in ('prototype.py', 'gpu_setup.py', 'diversity.py')]
     search = next(c for c in code if c.startswith("execute('search'"))
     runner = next(c for c in code if c.startswith('def execute('))
-    assert "'--gpu-ids'" in runner and "'--parallel-folds'" in runner
+    assert "'--gpu-ids'" in runner and "'--parallel-folds'" not in runner
     assert "execute('search')" in search
+    assert 'pip install' not in '\n'.join(code)
+    assert '_gpu_setup.require_t4_pair' in embedded
 
 
 def test_gpu_disabled_reports_accelerator_before_any_install(monkeypatch, tmp_path):

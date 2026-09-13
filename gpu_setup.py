@@ -44,6 +44,30 @@ def detect_gpu_ids(max_gpus=2):
     return selectors[:max_gpus]
 
 
+def require_t4_pair(selectors=None):
+    """Require two visible T4 devices and return their physical CUDA selectors."""
+    selectors = detect_gpu_ids(2) if selectors is None else list(map(str, selectors))
+    if len(selectors) != 2 or len(set(selectors)) != 2:
+        raise RuntimeError('This Notebook requires exactly two visible T4 GPUs. Select GPU T4 x2 in Kaggle.')
+    try:
+        result = subprocess.run(['nvidia-smi', '--query-gpu=index,uuid,name', '--format=csv,noheader'],
+            check=True, text=True, capture_output=True)
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError('Cannot inspect the required T4 x2 accelerator with nvidia-smi.') from exc
+    inventory = [tuple(part.strip() for part in line.split(',', 2))
+                 for line in result.stdout.splitlines() if line.strip()]
+    names = []
+    for selector in selectors:
+        matches = [name for index, uuid, name in inventory
+                   if selector == index or uuid.startswith(selector) or selector.startswith(uuid)]
+        if len(matches) != 1:
+            raise RuntimeError(f'Cannot resolve visible GPU selector {selector!r}.')
+        names.append(matches[0])
+    if any('T4' not in name.upper() for name in names):
+        raise RuntimeError(f'This Notebook requires T4 x2; detected {names}.')
+    return selectors
+
+
 def _probe(command, env, log_path):
     result = subprocess.run(command, text=True, capture_output=True, env=env)
     output = (result.stdout or "") + (result.stderr or "")
@@ -76,7 +100,7 @@ def ensure_lightgbm_backend(script, device="cuda", gpu_id=0, build_if_missing=Tr
         smi = shutil.which("nvidia-smi")
         if not smi:
             raise RuntimeError("Enable a GPU in Kaggle Settings > Accelerator, then rerun this cell.")
-        subprocess.run([smi, "--query-gpu=index,name", "--format=csv,noheader"], check=True)
+        subprocess.run([smi, "--query-gpu=index,name", "--format=csv,noheader"], check=True, env=env)
     log_path = folder / "gpu_preflight_before.log"
     probe, failure = _probe(command, env, log_path)
     if probe.returncode == 0:
