@@ -81,3 +81,28 @@ def test_constant_key_is_selected_only_from_training_rows():
     b = fe.transform(changed)
     assert list(a) == list(b)
     assert 'k4' not in fe.keep
+
+
+def test_domain_features_keep_original_signals_and_exclude_own_labels():
+    x, y = dataset()
+    x['Charging_Stations_Near_Home'] = np.arange(len(x)) % 5
+    x['Charging_Stations_Near_Work'] = np.arange(len(x)) % 7
+    x['Range_Anxiety_Level'] = np.resize(['Low', 'Medium', 'High'], len(x))
+    baseline = p.make_features('multiscale_dual').fit_transform(x, y)
+    fe = p.make_features('multiscale_domain')
+    actual = fe.fit_transform(x, y)
+    pd.testing.assert_frame_equal(actual[baseline.columns], baseline)
+    assert 'domain_commute_per_station' in actual
+    np.testing.assert_allclose(actual.domain_stations_total, x.Charging_Stations_Near_Home + x.Charging_Stations_Near_Work)
+    te_cols = [c for c in actual if '_te' in c]
+    for row in (0, 30):
+        flipped = y.copy()
+        flipped[row] = 1 - flipped[row]
+        other = p.make_features('multiscale_domain').fit_transform(x, flipped)
+        np.testing.assert_array_equal(actual.loc[row, te_cols], other.loc[row, te_cols])
+    unseen = x.iloc[:2].copy()
+    unseen['Range_Anxiety_Level'] = ['Unknown', None]
+    unseen['Charging_Stations_Near_Work'] = [np.nan, -1]
+    transformed = fe.transform(unseen)
+    assert list(transformed) == list(actual)
+    assert np.isfinite(transformed[te_cols].to_numpy()).all()

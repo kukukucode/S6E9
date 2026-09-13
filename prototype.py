@@ -280,7 +280,42 @@ class SignalFeatures:
         return pd.concat([base, pd.DataFrame(extras, index=base.index)], axis=1)
 
 
+def domain_features(x):
+    """Deterministic EV interactions; no labels or fitted statistics."""
+    x = x.reset_index(drop=True)
+    values = {}
+    def num(name):
+        return pd.to_numeric(x[name], errors='coerce').astype(np.float64)
+    home, work = 'Charging_Stations_Near_Home', 'Charging_Stations_Near_Work'
+    if home in x and work in x:
+        total = num(home) + num(work)
+        values['domain_stations_total'] = total
+        values['domain_stations_gap'] = num(home) - num(work)
+        if 'Daily_Commute_km' in x:
+            values['domain_commute_per_station'] = num('Daily_Commute_km') / (1 + total)
+    if 'Annual_Income_USD' in x and 'Number_of_Cars_Owned' in x:
+        values['domain_income_per_car'] = num('Annual_Income_USD') / (1 + num('Number_of_Cars_Owned'))
+    if 'Range_Anxiety_Level' in x:
+        values['domain_anxiety_ordinal'] = x['Range_Anxiety_Level'].map({'Low': 0, 'Medium': 1, 'High': 2})
+    return pd.DataFrame(values, index=x.index).replace([np.inf, -np.inf], np.nan)
+
+
+class DomainSignalFeatures(SignalFeatures):
+    """Keep every multiscale_dual feature unchanged; add domain values, frequency and TE."""
+    def __init__(self, seed=SEED):
+        super().__init__('multiscale_dual', seed)
+
+    def keys(self, x):
+        keys, numeric = super().keys(x)
+        for name, values in domain_features(x).items():
+            keys[name] = Features.tokens(values)
+            numeric[name] = values.astype(np.float32)
+        return keys, numeric
+
+
 def make_features(variant, seed=SEED):
+    if variant == 'multiscale_domain':
+        return DomainSignalFeatures(seed)
     return SignalFeatures(variant, seed) if variant in SIGNAL_VARIANTS else Features(variant, seed)
 
 
@@ -434,7 +469,7 @@ def prediction_batch(x, y, xp, candidate, cfg, seeds, valid_y=None, model_dir=No
             implementation=digest(__file__))
     preds, rounds = [], []
     prepared = None
-    seed_dependent = variant == "target" or variant in SIGNAL_VARIANTS
+    seed_dependent = variant in ("target", "multiscale_domain") or variant in SIGNAL_VARIANTS
     for seed in seeds:
         path = meta_path = None
         if signature is not None:

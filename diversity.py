@@ -11,9 +11,11 @@ import importlib.metadata
 import itertools
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import joblib
 import numpy as np
@@ -23,6 +25,7 @@ from scipy.stats import rankdata
 from sklearn.metrics import roc_auc_score
 
 import prototype as p
+from gpu_setup import detect_gpu_ids
 
 
 def key(value):
@@ -34,8 +37,9 @@ def context(args):
     settings = dict(seed=args.seed, threads=args.threads, gpu_ids=args.gpu_ids,
         parallel_folds=args.parallel_folds, max_rounds=args.max_rounds,
         early_stopping=args.early_stopping, auc_window=args.auc_window, max_corr=args.max_corr,
+        cache_compression=args.cache_compression, domain_compare=args.domain_compare,
         hashes={f: p.digest(Path(args.data) / f) for f in ('train.csv', 'test.csv', 'sample_submission.csv')},
-        sources={f: p.digest(Path(__file__).with_name(f)) for f in ('prototype.py', 'diversity.py')},
+        sources={f: p.digest(Path(__file__).with_name(f)) for f in ('prototype.py', 'diversity.py', 'gpu_setup.py')},
         versions={name: importlib.metadata.version(name) for name in
             ('numpy', 'pandas', 'scikit-learn', 'lightgbm', 'xgboost', 'catboost', 'optuna', 'joblib', 'scipy')})
     path = run / 'config.json'
@@ -95,9 +99,20 @@ def checked_npz(path):
     return pred, meta
 
 
+def cache_compression(requested, matrices, folder):
+    estimated = sum(int(x.memory_usage(index=True, deep=True).sum()) for x in matrices)
+    free = shutil.disk_usage(folder).free
+    reserve = 512 * 1024 ** 2
+    if free < reserve:
+        raise RuntimeError('Feature cache disk space is low. Save outputs and free space before resuming.')
+    # Budget for two workers writing concurrently. Compression only changes storage.
+    return 3 if requested == 0 and free < estimated * 3 + reserve else requested
+
+
 def worker(path):
     """One fresh process sees at most one GPU, selected before importing ML libraries."""
     job = p.read_json(path)
+    started = time.perf_counter()
     cfg, candidate = job['config'], job['candidate']
     tr, te, _, _, cols = p.load_data(job['data'])
     y = tr[p.TARGET].to_numpy(dtype=int)
@@ -116,7 +131,8 @@ def worker(path):
         seed=cfg['seed'], variant=candidate['variant'], phase=phase, fold=fold)
     cache = Path(job['run']) / 'cache' / 'features' / (key(identity) + '.joblib')
     meta_path = cache.with_suffix('.json')
-    if cache.exists() and meta_path.exists():
+    cache_hit = cache.exists() and meta_path.exists()
+    if cache_hit:
         if p.read_json(meta_path)['sha256'] != p.digest(cache):
             raise ValueError(f'Corrupt feature cache: {cache}')
         # These are our own locally produced caches, never downloaded pickle inputs.
@@ -127,14 +143,17 @@ def worker(path):
         train_x, pred_x = fe.fit_transform(xt, y[it]), fe.transform(xp)
         cache.parent.mkdir(parents=True, exist_ok=True)
         temporary = cache.with_suffix('.tmp')
-        joblib.dump((train_x, pred_x), temporary, compress=3)
+        compression = cache_compression(cfg.get('cache_compression', 0), (train_x, pred_x), cache.parent)
+        joblib.dump((train_x, pred_x), temporary, compress=compression)
         temporary.replace(cache)
-        p.write_json(meta_path, dict(sha256=p.digest(cache)))
+        p.write_json(meta_path, dict(sha256=p.digest(cache), compression=compression, bytes=cache.stat().st_size))
+        del fe
     valid = (pred_x, y[iv]) if phase == 'dev' else None
     fixed = candidate.get('fixed_rounds') if phase != 'dev' else None
     backend = dict(max_rounds=cfg['max_rounds'], early_stopping=cfg['early_stopping'],
         threads=job['threads'], lgb_device=candidate['device'], lgb_gpu_id=0,
         xgb_device='cuda:0' if candidate['device'] == 'cuda' else 'cpu')
+    prepared_at = time.perf_counter()
     model, rounds = p.fit_model(candidate['family'], candidate['params'], train_x, y[it],
         valid, cfg['seed'], backend, fixed)
     if candidate['family'] == 'xgb' and candidate['device'] == 'cuda':
@@ -148,7 +167,9 @@ def worker(path):
         np.savez_compressed(stream, prediction=prediction)
     temporary.replace(output)
     p.write_json(output.with_suffix('.json'), dict(sha256=p.digest(output), rounds=max(1, int(rounds)),
-        validation_rows=len(iv), test_rows=0 if phase == 'dev' else len(te)))
+        validation_rows=len(iv), test_rows=0 if phase == 'dev' else len(te), feature_cache_hit=cache_hit,
+        prepare_seconds=prepared_at-started, fit_predict_seconds=time.perf_counter()-prepared_at,
+        feature_cache_bytes=cache.stat().st_size))
 
 
 def folds(args, cfg, candidate, phase, requested):
@@ -243,6 +264,8 @@ def search(args):
         raise RuntimeError('Holdout already opened; search is disabled for this run.')
     if not (run / 'candidates/main.json').exists():
         evaluate(args, cfg, anchor())
+    if args.domain_compare and not (run / 'candidates/domain.json').exists():
+        evaluate(args, cfg, dict(anchor(), name='domain', lane='domain', variant='multiscale_domain'))
     for lane, budget in [('lgb', args.lgb_trials), ('xgb', args.xgb_trials)]:
         if budget == 0:
             continue
@@ -307,7 +330,11 @@ def freeze(args):
         return
     if (run / 'SEALED_OPENED.json').exists():
         raise RuntimeError('Holdout already opened; cannot select candidates again.')
-    selected = [load_candidate(run, 'main', y, dev, sealed)]
+    baseline = load_candidate(run, 'main', y, dev, sealed)
+    selected = [baseline]
+    if args.domain_compare:
+        selected.append(load_candidate(run, 'domain', y, dev, sealed))
+        selected.sort(key=lambda pair: pair[0]['dev_auc'], reverse=True)
     # Only COMPLETE study trials qualify; never include interrupted or pruned artifacts.
     for lane, limit in [('lgb', 3), ('xgb', 2)]:
         if not any((run / 'candidates').glob(f'{lane}_*.json')):
@@ -341,7 +368,7 @@ def freeze(args):
         pearson=np.nan_to_num(np.atleast_2d(np.corrcoef(matrix[dev], rowvar=False)), nan=1).tolist()))
     chosen = [(c, float(w)) for (c, _), w in zip(selected, best['weights']) if w > 0]
     p.write_json(run / 'frozen.json', dict(candidates=[c for c, _ in chosen], weights=[w for _, w in chosen],
-        mode='probability', development_selection_auc=best['auc'], baseline=selected[0][0],
+        mode='probability', development_selection_auc=best['auc'], baseline=baseline[0],
         config_sha256=p.digest(run / 'config.json'),
         note='Weights selected only on development OOF. Selection-biased; no Public LB tuning.'))
     print(f'Frozen probability blend; dev AUC={best["auc"]:.7f}; weights={[w for _, w in chosen]}', flush=True)
@@ -410,11 +437,13 @@ def main():
     parser.add_argument('command', choices=['search', 'freeze', 'audit', 'finalize', 'worker'])
     parser.add_argument('--job')
     parser.add_argument('--data', default='/kaggle/input/competitions/playground-series-s6e9')
-    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5')
+    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_1')
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--threads', type=int, default=4, help='Total CPU budget across concurrent folds')
-    parser.add_argument('--gpu-ids', type=int, nargs='+', default=[0])
-    parser.add_argument('--parallel-folds', type=int, choices=[1, 2], default=1)
+    parser.add_argument('--gpu-ids', nargs='+', default=None, help='Physical GPU IDs/UUIDs; default auto-detect up to two')
+    parser.add_argument('--parallel-folds', type=int, choices=[1, 2], default=None)
+    parser.add_argument('--cache-compression', type=int, choices=[0, 3], default=0)
+    parser.add_argument('--domain-compare', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--max-rounds', type=int, default=3500)
     parser.add_argument('--early-stopping', type=int, default=120)
     parser.add_argument('--lgb-trials', type=int, default=12)
@@ -431,8 +460,12 @@ def main():
         parser.error('Invalid budgets')
     if not 0 < args.max_corr <= 1 or args.auc_window < 0 or args.auc_window > 1:
         parser.error('Invalid candidate filtering thresholds')
-    if min(args.gpu_ids) < 0 or len(set(args.gpu_ids)) != len(args.gpu_ids):
-        parser.error('GPU IDs must be unique nonnegative integers')
+    if args.gpu_ids is None:
+        args.gpu_ids = detect_gpu_ids()
+    if args.parallel_folds is None:
+        args.parallel_folds = min(2, len(args.gpu_ids), args.threads)
+    if any(not (s.isdigit() or s.startswith(('GPU-', 'MIG-'))) for s in args.gpu_ids) or len(set(args.gpu_ids)) != len(args.gpu_ids):
+        parser.error('GPU selectors must be unique nonnegative IDs or UUIDs')
     globals()[args.command](args)
 
 

@@ -14,6 +14,36 @@ import sys
 CUDA_LIGHTGBM_VERSION = "4.7.0"
 
 
+def detect_gpu_ids(max_gpus=2):
+    """Return physical selectors for child CUDA_VISIBLE_DEVICES, preserving restrictions."""
+    if max_gpus < 1:
+        raise ValueError('max_gpus must be positive')
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if visible is not None:
+        selectors = []
+        for token in visible.split(','):
+            token = token.strip()
+            if token.isdigit() or token.startswith(('GPU-', 'MIG-')):
+                if token in selectors:
+                    break
+                selectors.append(token)
+            else:
+                # CUDA stops enumeration at the first invalid token, including -1.
+                break
+    else:
+        try:
+            result = subprocess.run(['nvidia-smi', '--query-gpu=uuid', '--format=csv,noheader'],
+                check=True, text=True, capture_output=True)
+            selectors = [s.strip() for s in result.stdout.splitlines() if s.strip().startswith('GPU-')]
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            selectors = []
+    if not selectors:
+        raise RuntimeError('No visible NVIDIA GPU. Enable Kaggle Settings > Accelerator and check CUDA_VISIBLE_DEVICES.')
+    if any(s.startswith('MIG-') for s in selectors):
+        return selectors[:1]
+    return selectors[:max_gpus]
+
+
 def _probe(command, env, log_path):
     result = subprocess.run(command, text=True, capture_output=True, env=env)
     output = (result.stdout or "") + (result.stderr or "")
@@ -29,13 +59,15 @@ def _failed(result, log_path):
         f"Full diagnostic log: {log_path}. Share this log before trying another rebuild.")
 
 
-def ensure_lightgbm_backend(script, device="cuda", gpu_id=0, build_if_missing=True):
+def ensure_lightgbm_backend(script, device="cuda", gpu_id=0, build_if_missing=True, visible_devices=None):
     if device not in ("cpu", "cuda"):
         raise ValueError("Choose cpu or cuda")
     command = [sys.executable, "-X", "faulthandler", "-u", str(script), "check-device", "--lgb-device", device,
                "--lgb-gpu-id", str(gpu_id), "--threads", "2"]
     folder = Path(script).resolve().parent
     env = os.environ.copy()
+    if visible_devices is not None:
+        env['CUDA_VISIBLE_DEVICES'] = str(visible_devices)
     env["PYTHONFAULTHANDLER"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
     if device == "cuda":
