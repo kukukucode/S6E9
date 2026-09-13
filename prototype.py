@@ -626,7 +626,7 @@ def audit(args):
     baseline = fitted_predictions(tr[cols].iloc[dev], y[dev], both, frozen["baseline"], cfg)[:len(sealed)]
     report = dict(sealed_auc=float(roc_auc_score(y[sealed], p)),
         baseline_sealed_auc=float(roc_auc_score(y[sealed], baseline)), public_lb=None,
-        public_lb_target=0.94635, sealed_rows=len(sealed),
+        sealed_rows=len(sealed),
         holdout_previously_reviewed=cfg.get("holdout_previously_reviewed", False),
         note=("Public LB is unmeasured. This holdout split was reviewed previously; this is not a fresh independent evaluation. Do not tune using this result."
               if cfg.get("holdout_previously_reviewed", False) else

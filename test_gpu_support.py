@@ -96,7 +96,7 @@ def test_gpu_setup_does_not_rebuild_or_fall_back_for_unrelated_failure(monkeypat
     assert all('pip' not in c for c in calls)
 
 
-def test_notebook_embeds_both_sources_and_passes_gpu_options():
+def test_notebook_embeds_sources_and_passes_gpu_options():
     root = Path(__file__).parent
     nb = json.loads((root / 'S6E9_Prototype.ipynb').read_text(encoding='utf8'))
     code = [''.join(c['source']) for c in nb['cells'] if c['cell_type'] == 'code']
@@ -104,9 +104,11 @@ def test_notebook_embeds_both_sources_and_passes_gpu_options():
     literals = [ast.literal_eval(n.value.args[0]) for n in ast.parse(embedded).body
                 if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
                 and isinstance(n.value.func, ast.Attribute) and n.value.func.attr == 'write_text']
-    assert literals == [(root / name).read_text(encoding='utf8') for name in ('prototype.py', 'gpu_setup.py')]
+    assert literals == [(root / name).read_text(encoding='utf8') for name in ('prototype.py', 'gpu_setup.py', 'diversity.py')]
     search = next(c for c in code if c.startswith("execute('search'"))
-    assert "'--lgb-device', LGB_DEVICE" in search and "'--lgb-gpu-id'" in search
+    runner = next(c for c in code if c.startswith('def execute('))
+    assert "'--gpu-ids'" in runner and "'--parallel-folds'" in runner
+    assert "execute('search')" in search
 
 
 def test_gpu_disabled_reports_accelerator_before_any_install(monkeypatch, tmp_path):
