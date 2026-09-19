@@ -18,6 +18,31 @@ def test_micro_blend_keeps_baseline_and_convex_probabilities():
         assert np.count_nonzero(weights[1:]) <= 2
 
 
+def test_wide_blend_remains_bounded_and_crossfit_gate_needs_three_wins():
+    grid = list(d.weight_grid(5, .30))
+    assert any(np.isclose(weights[0], .70) for weights in grid)
+    assert all(weights[0] >= .70 - 1e-12 and np.isclose(weights.sum(), 1) for weights in grid)
+    base = dict(auc=.8, fold_auc=[.70, .70, .70, .70])
+    accepted, wins = d.improvement_gate(base, dict(auc=.801, fold_auc=[.71, .71, .71, .69]))
+    assert accepted and wins == 3
+    accepted, wins = d.improvement_gate(base, dict(auc=.801, fold_auc=[.71, .71, .69, .69]))
+    assert not accepted and wins == 2
+
+
+def test_seed_ensemble_averages_cached_member_predictions(monkeypatch):
+    calls = []
+    def fake(args, cfg, candidate, phase, requested):
+        seed = candidate.get('model_seed', cfg['seed'])
+        calls.append(seed)
+        return {fold: (np.full(3, seed / 10000), {'rounds': seed % 10 + 1}) for fold in requested}
+    monkeypatch.setattr(d, 'single_seed_folds', fake)
+    candidate = dict(d.domain_anchor(), model_seeds=[2026, 42, 3407])
+    result = d.folds(None, {'seed': 2026}, candidate, 'dev', [0])
+    assert calls == [2026, 42, 3407]
+    np.testing.assert_allclose(result[0][0], np.mean([2026, 42, 3407]) / 10000)
+    assert result[0][1]['model_seeds'] == [2026, 42, 3407]
+
+
 def test_rank_blend_is_fold_local_and_requires_three_fold_wins():
     matrix = np.array([[.1, .9], [.2, .8], [.8, .2], [.9, .1]])
     cv = [(None, np.array([0, 1])), (None, np.array([2, 3]))]
@@ -62,6 +87,12 @@ def test_domain_candidate_is_cuda_safe_and_gpu_primary_needs_three_wins():
     stronger[cv[2][1]] = reference[cv[2][1]]
     gate = d.gpu_primary_gate(y, stronger, reference, np.arange(16), cv)
     assert not gate['allowed'] and gate['fold_wins'] == 2
+
+
+def test_fixed_realmlp_candidate_uses_raw_features_and_gpu():
+    candidate = d.realmlp_anchor()
+    assert candidate == dict(name='realmlp_fixed', lane='realmlp', family='realmlp',
+                             variant='raw', params={'n_epochs': 128}, device='cuda')
 
 
 def test_changed_frozen_weights_cannot_be_audited_again(tmp_path):

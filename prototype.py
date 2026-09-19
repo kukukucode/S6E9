@@ -320,12 +320,22 @@ def make_features(variant, seed=SEED):
 
 
 def model_frame(x, family):
-    if family != "cat":
+    if family not in ("cat", "realmlp"):
         return x
     x = x.copy()
-    for c in x.select_dtypes(include="category"):
-        x[c] = x[c].astype(int).astype(str)
+    if family == "cat":
+        for c in x.select_dtypes(include="category"):
+            x[c] = x[c].astype(int).astype(str)
     return x
+
+
+def realmlp_stop_epoch(model, fallback):
+    values = getattr(model, "fit_params_", {}).get("stop_epoch", {})
+    if isinstance(values, dict):
+        values = list(values.values())
+    values = np.asarray(values if np.size(values) else [fallback], dtype=float).reshape(-1)
+    values = values[np.isfinite(values)]
+    return max(1, int(np.median(values))) if len(values) else max(1, int(fallback))
 
 
 def lgb_effective_device(params, cfg):
@@ -361,7 +371,7 @@ def fit_model(family, params, x, y, valid, seed, cfg, rounds=None):
         model.fit(x, y, eval_set=[valid] if valid else None,
             callbacks=[lgb.early_stopping(stop, verbose=False)] if valid else [])
         best = model.best_iteration_ if valid else n
-    else:
+    elif family == "cat":
         from catboost import CatBoostClassifier
         cats = list(x.select_dtypes(include=["object", "string"]))
         cat_device = cfg.get("cat_device", "cpu")
@@ -374,6 +384,26 @@ def fit_model(family, params, x, y, valid, seed, cfg, rounds=None):
         model.fit(x, y, cat_features=cats, eval_set=valid, use_best_model=bool(valid),
             early_stopping_rounds=stop if valid else None, verbose=False)
         best = model.get_best_iteration() + 1 if valid else n
+    elif family == "realmlp":
+        from pytabkit import RealMLP_TD_Classifier
+        options = dict(params)
+        epochs = int(options.pop("n_epochs", min(n, 256))) if rounds is None else n
+        options.update(device="cuda:0" if cfg.get("realmlp_device") == "cuda" else "cpu",
+            random_state=seed, n_threads=cfg["threads"], verbosity=0,
+            val_metric_name="1-auc_ovr", use_ls=False)
+        if valid is None:
+            options.update(stop_epoch=epochs, val_fraction=0.0)
+        else:
+            options["n_epochs"] = epochs
+        model = RealMLP_TD_Classifier(**options)
+        if valid is None:
+            model.fit(x, y)
+            best = epochs
+        else:
+            model.fit(x, y, valid[0], valid[1])
+            best = realmlp_stop_epoch(model, epochs)
+    else:
+        raise ValueError(f"Unknown model family: {family}")
     return model, max(1, int(best))
 
 
@@ -391,8 +421,12 @@ def defaults(family):
     if family == "lgb":
         return dict(max_depth=6, num_leaves=31, min_child_samples=80, reg_alpha=0.01,
             reg_lambda=8., subsample=0.85, subsample_freq=1, colsample_bytree=0.85, learning_rate=0.04, max_bin=255)
-    return dict(depth=6, learning_rate=0.04, l2_leaf_reg=8., random_strength=1.,
-        bootstrap_type="Bayesian", bagging_temperature=1.)
+    if family == "cat":
+        return dict(depth=6, learning_rate=0.04, l2_leaf_reg=8., random_strength=1.,
+            bootstrap_type="Bayesian", bagging_temperature=1.)
+    if family == "realmlp":
+        return dict(n_epochs=128)
+    raise ValueError(f"Unknown model family: {family}")
 
 
 def suggest(trial, family):

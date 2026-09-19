@@ -34,12 +34,14 @@ def context(args):
     settings = dict(seed=args.seed, threads=args.threads, gpu_ids=args.gpu_ids,
         parallel_folds=2, max_rounds=args.max_rounds,
         early_stopping=args.early_stopping, auc_window=args.auc_window, max_corr=args.max_corr,
-        domain_compare=args.domain_compare, cat_compare=args.cat_compare, screen_folds=args.screen_folds,
-        promote_trials=args.promote_trials,
+        domain_compare=args.domain_compare, cat_compare=args.cat_compare,
+        realmlp_compare=args.realmlp_compare, final_seeds=args.final_seeds,
+        screen_folds=args.screen_folds, promote_trials=args.promote_trials,
         hashes={f: p.digest(Path(args.data) / f) for f in ('train.csv', 'test.csv', 'sample_submission.csv')},
         sources={f: p.digest(Path(__file__).with_name(f)) for f in ('prototype.py', 'diversity.py', 'gpu_setup.py')},
         versions={name: importlib.metadata.version(name) for name in
-            ('numpy', 'pandas', 'scikit-learn', 'lightgbm', 'xgboost', 'catboost', 'optuna', 'joblib', 'scipy')})
+            ('numpy', 'pandas', 'scikit-learn', 'lightgbm', 'xgboost', 'catboost', 'optuna',
+             'joblib', 'scipy') + (('pytabkit',) if args.realmlp_compare else ())})
     path = run / 'config.json'
     if path.exists():
         if p.read_json(path) != settings:
@@ -83,6 +85,11 @@ def domain_anchor():
     params = dict(anchor()['params'], max_bin=p.LGB_CUDA_BIN_LIMIT)
     return dict(name='domain', lane='domain', family='lgb', variant='multiscale_domain',
                 params=params, device='cuda')
+
+
+def realmlp_anchor():
+    return dict(name='realmlp_fixed', lane='realmlp', family='realmlp', variant='raw',
+                params=p.defaults('realmlp'), device='cuda')
 
 
 def suggest(trial, lane):
@@ -164,13 +171,15 @@ def worker(path, data_state=None):
             p.write_json(meta_path, dict(sha256=p.digest(cache), compression=0, bytes=cache.stat().st_size))
         valid = (pred_x, y[iv]) if phase == 'dev' else None
         fixed = candidate.get('fixed_rounds') if phase != 'dev' else None
+        model_seed = candidate.get('model_seed', cfg['seed'])
         backend = dict(max_rounds=cfg['max_rounds'], early_stopping=cfg['early_stopping'],
             threads=job['threads'], lgb_device=candidate['device'], lgb_gpu_id=0,
             xgb_device='cuda:0' if candidate['device'] == 'cuda' else 'cpu',
-            cat_device=candidate['device'], cat_gpu_id=0)
+            cat_device=candidate['device'], cat_gpu_id=0,
+            realmlp_device=candidate['device'])
         prepared_at = time.perf_counter()
         model, rounds = p.fit_model(candidate['family'], candidate['params'], train_x, y[it],
-            valid, cfg['seed'], backend, fixed)
+            valid, model_seed, backend, fixed)
         if candidate['family'] == 'xgb' and candidate['device'] == 'cuda':
             actual = json.loads(model.get_booster().save_config())['learner']['generic_param']['device']
             if not actual.startswith('cuda'):
@@ -179,6 +188,10 @@ def worker(path, data_state=None):
             actual = str(model.get_param('task_type') or '').upper()
             if actual != 'GPU':
                 raise RuntimeError(f'CatBoost did not use the requested GPU: {actual}')
+        if candidate['family'] == 'realmlp' and candidate['device'] == 'cuda':
+            import torch
+            if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+                raise RuntimeError('RealMLP worker does not see its isolated T4.')
         prediction = p.predict(model, pred_x, candidate['family'])
         output = Path(job['outputs'][str(fold)])
         temporary = output.with_suffix('.tmp')
@@ -187,7 +200,7 @@ def worker(path, data_state=None):
         temporary.replace(output)
         p.write_json(output.with_suffix('.json'), dict(sha256=p.digest(output), rounds=max(1, int(rounds)),
             candidate=candidate['name'], family=candidate['family'], device=candidate['device'],
-            phase=phase, fold=fold,
+            phase=phase, fold=fold, model_seed=model_seed,
             validation_rows=len(iv), test_rows=0 if phase == 'dev' else len(te), feature_cache_hit=cache_hit,
             prepare_seconds=prepared_at-started, fit_predict_seconds=time.perf_counter()-prepared_at,
             feature_cache_bytes=cache.stat().st_size))
@@ -326,7 +339,7 @@ def write_runtime_profile(run):
         note='Summed worker time; parallel jobs overlap in wall-clock time.', groups=groups))
 
 
-def folds(args, cfg, candidate, phase, requested):
+def single_seed_folds(args, cfg, candidate, phase, requested):
     run = Path(args.run)
     cache = run / 'cache' / 'predictions'
     cache.mkdir(parents=True, exist_ok=True)
@@ -335,6 +348,8 @@ def folds(args, cfg, candidate, phase, requested):
     results = {}
     y, (_, _, cv, _) = args._data[5], args._data[6]
     spec = {k: candidate[k] for k in ('family', 'variant', 'params', 'device')}
+    if 'model_seed' in candidate:
+        spec['model_seed'] = candidate['model_seed']
     if phase != 'dev':
         spec['fixed_rounds'] = candidate['fixed_rounds']
     threads = args.threads if candidate['device'] == 'cpu' else max(1, args.threads // 2)
@@ -402,6 +417,26 @@ def folds(args, cfg, candidate, phase, requested):
             score = float(roc_auc_score(y[cv[fold][1]], results[fold][0]))
             print(f'{candidate["name"]} fold={fold} AUC={score:.7f}', flush=True)
     return results
+
+
+def folds(args, cfg, candidate, phase, requested):
+    seeds = candidate.get('model_seeds')
+    if not seeds:
+        return single_seed_folds(args, cfg, candidate, phase, requested)
+    members = []
+    for seed in seeds:
+        member = {key: value for key, value in candidate.items() if key != 'model_seeds'}
+        if seed != cfg['seed']:
+            member['model_seed'] = seed
+        members.append(single_seed_folds(args, cfg, member, phase, requested))
+    averaged = {}
+    for fold in requested:
+        predictions = [result[fold][0] for result in members]
+        metadata = dict(members[0][fold][1])
+        metadata.update(rounds=int(np.median([result[fold][1]['rounds'] for result in members])),
+                        model_seeds=list(seeds), ensemble_size=len(seeds))
+        averaged[fold] = np.mean(predictions, axis=0), metadata
+    return averaged
 
 
 def evaluate(args, cfg, candidate, requested=None, stage='full'):
@@ -545,6 +580,20 @@ def search(args):
             'screen_folds': args.screen_folds, 'promote_trials': args.promote_trials, 'lanes': {}}
         manifest['lanes']['cat'] = ['cat_fixed']
         p.write_json(manifest_path, manifest)
+    if getattr(args, 'realmlp_compare', False):
+        candidate = realmlp_anchor()
+        path = run / 'candidates' / 'realmlp_fixed.json'
+        if not path.exists():
+            evaluate(args, cfg, candidate, requested=list(range(args.screen_folds)), stage='screen')
+        record = p.read_json(path)
+        if record.get('stage') != 'full':
+            print('Promoting realmlp_fixed to full 4-fold CV', flush=True)
+            evaluate(args, cfg, candidate, requested=list(range(4)), stage='full')
+        manifest_path = run / 'promoted.json'
+        manifest = p.read_json(manifest_path) if manifest_path.exists() else {
+            'screen_folds': args.screen_folds, 'promote_trials': args.promote_trials, 'lanes': {}}
+        manifest['lanes']['realmlp'] = ['realmlp_fixed']
+        p.write_json(manifest_path, manifest)
     write_screen_diagnostics(run)
     write_runtime_profile(run)
     print('Search complete. No holdout labels used.', flush=True)
@@ -563,20 +612,27 @@ def load_candidate(run, name, y, dev, sealed):
     return record, oof
 
 
-def weight_grid(size):
+def weight_grid(size, max_secondary=.10):
+    if not 0 <= max_secondary <= .30:
+        raise ValueError('Secondary blend cap must be between 0 and 0.30')
     unit = np.zeros(size)
     unit[0] = 1
     yield unit.copy()
+    fractions = [fraction for fraction in (.01, .02, .03, .05, .07, .10, .15, .20, .25, .30)
+                 if fraction <= max_secondary + 1e-12]
     for i in range(1, size):
-        for fraction in (.01, .02, .03, .05, .07, .10):
+        for fraction in fractions:
             w = unit.copy()
             w[0], w[i] = 1 - fraction, fraction
             yield w
     for i, j in itertools.combinations(range(1, size), 2):
-        for a, b in ((.01, .01), (.02, .02), (.03, .02), (.02, .03), (.03, .03), (.05, .05)):
-            w = unit.copy()
-            w[0], w[i], w[j] = 1 - a - b, a, b
-            yield w
+        for a in fractions:
+            for b in fractions:
+                if a + b > max_secondary + 1e-12:
+                    continue
+                w = unit.copy()
+                w[0], w[i], w[j] = 1 - a - b, a, b
+                yield w
 
 
 def rank_columns(matrix):
@@ -602,6 +658,36 @@ def blend_values(matrix, weights, mode):
 
 def fold_auc_scores(y, prediction, cv):
     return [float(roc_auc_score(y[iv], prediction[iv])) for _, iv in cv]
+
+
+def best_blend(y, values, rows, max_secondary):
+    weights = next(weight_grid(values.shape[1], max_secondary))
+    score = float(roc_auc_score(y[rows], values[rows] @ weights))
+    for candidate in weight_grid(values.shape[1], max_secondary):
+        candidate_score = float(roc_auc_score(y[rows], values[rows] @ candidate))
+        if candidate_score > score + 1e-6:
+            score, weights = candidate_score, candidate.copy()
+    return score, weights
+
+
+def crossfit_blend(y, values, cv, max_secondary):
+    prediction = np.full(len(y), np.nan)
+    weights = []
+    for fold, (_, iv) in enumerate(cv):
+        training = np.concatenate([other_iv for other_fold, (_, other_iv) in enumerate(cv)
+                                   if other_fold != fold])
+        _, selected = best_blend(y, values, training, max_secondary)
+        prediction[iv] = values[iv] @ selected
+        weights.append(selected.tolist())
+    development = np.concatenate([iv for _, iv in cv])
+    return dict(auc=float(roc_auc_score(y[development], prediction[development])),
+                fold_auc=fold_auc_scores(y, prediction, cv), fold_weights=weights,
+                prediction=prediction)
+
+
+def improvement_gate(base, candidate):
+    wins = sum(right > left + 1e-6 for left, right in zip(base['fold_auc'], candidate['fold_auc']))
+    return candidate['auc'] > base['auc'] + 1e-6 and wins >= 3, wins
 
 
 def rank_blend_allowed(probability_auc, rank_auc, probability_folds, rank_folds):
@@ -684,13 +770,13 @@ def freeze(args):
     manifest_path = run / 'promoted.json'
     manifest = p.read_json(manifest_path) if manifest_path.exists() else {'lanes': {}}
     # Only the latest explicit promotion set can be selected.
-    for lane, limit in [('lgb', 3), ('xgb', 2), ('cat', 1)]:
+    for lane, limit in [('lgb', 3), ('xgb', 2), ('cat', 1), ('realmlp', 1)]:
         if not any((run / 'candidates').glob(f'{lane}_*.json')):
             continue
         if lane not in manifest.get('lanes', {}):
             raise ValueError(f'Missing promoted.json entry for {lane}; rerun search before freeze.')
         names = manifest['lanes'][lane]
-        if lane == 'cat':
+        if lane in ('cat', 'realmlp'):
             complete = set(names)
         else:
             study = optuna.load_study(study_name=lane,
@@ -728,20 +814,42 @@ def freeze(args):
     selected = [primary] + [pair for pair in selected if pair[0]['name'] != primary[0]['name']]
     p.write_json(run / 'gpu_primary_selection.json', dict(cpu_baseline=baseline[0]['name'],
         chosen_primary=primary[0]['name'], required_fold_wins=3, candidates=gates))
+    seed_diagnostic = dict(enabled=False, accepted=False, reason='Primary is not a GPU model or one seed was requested.')
+    final_seeds = list(getattr(args, 'final_seeds', [cfg.get('seed', 2026)]))
+    if primary[0].get('device') == 'cuda' and len(final_seeds) > 1:
+        averaged_candidate = dict(primary[0], name=primary[0]['name'] + '_seedavg',
+                                  model_seeds=final_seeds)
+        evaluate(args, cfg, averaged_candidate, requested=list(range(4)), stage='full')
+        averaged = load_candidate(run, averaged_candidate['name'], y, dev, sealed)
+        gate = gpu_primary_gate(y, averaged[1], primary[1], dev, cv)
+        seed_diagnostic = dict(enabled=True, accepted=gate['allowed'], seeds=final_seeds,
+            base_candidate=primary[0]['name'], averaged_candidate=averaged[0]['name'], **gate)
+        if gate['allowed']:
+            selected[0] = averaged
+            primary = averaged
+            tie_pool.append(averaged)
+    p.write_json(run / 'seed_average_comparison.json', seed_diagnostic)
     matrix = np.column_stack([oof for _, oof in selected])
     rank_matrix = rank_oof_matrix(matrix, cv)
     best = {}
     for mode, values in [('probability', matrix), ('rank', rank_matrix)]:
-        winner = dict(auc=float(roc_auc_score(y[dev], values[dev, 0])),
-                      weights=next(weight_grid(len(selected))))
-        for weights in weight_grid(len(selected)):
-            score = float(roc_auc_score(y[dev], values[dev] @ weights))
-            if score > winner['auc'] + 1e-6:
-                winner = dict(auc=score, weights=weights.copy())
-        winner['fold_auc'] = fold_auc_scores(y, values @ winner['weights'], cv)
+        narrow_cv = crossfit_blend(y, values, cv, .10)
+        wide_cv = crossfit_blend(y, values, cv, .30)
+        wide_allowed, wide_wins = improvement_gate(narrow_cv, wide_cv)
+        cap = .30 if wide_allowed else .10
+        score, weights = best_blend(y, values, dev, cap)
+        winner = dict(auc=score, weights=weights,
+            fold_auc=fold_auc_scores(y, values @ weights, cv), cap=cap,
+            crossfit_auc=(wide_cv if wide_allowed else narrow_cv)['auc'],
+            crossfit_fold_auc=(wide_cv if wide_allowed else narrow_cv)['fold_auc'],
+            crossfit_fold_weights=(wide_cv if wide_allowed else narrow_cv)['fold_weights'],
+            wide_allowed=wide_allowed, wide_fold_wins=wide_wins,
+            narrow_crossfit_auc=narrow_cv['auc'], narrow_crossfit_fold_auc=narrow_cv['fold_auc'],
+            wide_crossfit_auc=wide_cv['auc'], wide_crossfit_fold_auc=wide_cv['fold_auc'])
         best[mode] = winner
-    allowed, rank_wins = rank_blend_allowed(best['probability']['auc'], best['rank']['auc'],
-        best['probability']['fold_auc'], best['rank']['fold_auc'])
+    allowed, rank_wins = rank_blend_allowed(best['probability']['crossfit_auc'],
+        best['rank']['crossfit_auc'], best['probability']['crossfit_fold_auc'],
+        best['rank']['crossfit_fold_auc'])
     mode = 'rank' if allowed else 'probability'
     winner = best[mode]
     blend_matrix = rank_matrix if mode == 'rank' else matrix
@@ -768,9 +876,23 @@ def freeze(args):
     p.write_json(run / 'blend_comparison.json', dict(
         candidates=[c['name'] for c, _ in selected],
         probability=dict(auc=best['probability']['auc'], weights=best['probability']['weights'].tolist(),
-                         fold_auc=best['probability']['fold_auc']),
+                         fold_auc=best['probability']['fold_auc'], cap=best['probability']['cap'],
+                         crossfit_auc=best['probability']['crossfit_auc'],
+                         crossfit_fold_auc=best['probability']['crossfit_fold_auc'],
+                         crossfit_fold_weights=best['probability']['crossfit_fold_weights'],
+                         wide_allowed=best['probability']['wide_allowed'],
+                         wide_fold_wins=best['probability']['wide_fold_wins'],
+                         narrow_crossfit_auc=best['probability']['narrow_crossfit_auc'],
+                         wide_crossfit_auc=best['probability']['wide_crossfit_auc']),
         rank=dict(auc=best['rank']['auc'], weights=best['rank']['weights'].tolist(),
-                  fold_auc=best['rank']['fold_auc']),
+                  fold_auc=best['rank']['fold_auc'], cap=best['rank']['cap'],
+                  crossfit_auc=best['rank']['crossfit_auc'],
+                  crossfit_fold_auc=best['rank']['crossfit_fold_auc'],
+                  crossfit_fold_weights=best['rank']['crossfit_fold_weights'],
+                  wide_allowed=best['rank']['wide_allowed'],
+                  wide_fold_wins=best['rank']['wide_fold_wins'],
+                  narrow_crossfit_auc=best['rank']['narrow_crossfit_auc'],
+                  wide_crossfit_auc=best['rank']['wide_crossfit_auc']),
         rank_fold_wins=rank_wins, rank_required_fold_wins=3, chosen_mode=mode))
     p.write_json(run / 'candidate_correlation.json', dict(names=[c['name'] for c, _ in selected],
         pearson=np.nan_to_num(np.atleast_2d(np.corrcoef(matrix[dev], rowvar=False)), nan=1).tolist()))
@@ -877,12 +999,15 @@ def main():
     parser.add_argument('command', choices=['search', 'freeze', 'audit', 'finalize', 'worker', 'worker-loop'])
     parser.add_argument('--job')
     parser.add_argument('--data', default='/kaggle/input/competitions/playground-series-s6e9')
-    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_7')
+    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v6_0')
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--threads', type=int, default=4, help='Total CPU budget across concurrent folds')
     parser.add_argument('--gpu-ids', nargs='+', default=None, help='Two physical T4 IDs/UUIDs; default auto-detect')
     parser.add_argument('--domain-compare', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--cat-compare', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--realmlp-compare', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--final-seeds', nargs='+', type=int, default=[2026, 42, 3407],
+                        help='Average these seeds only when the selected primary GPU model passes the OOF gate')
     parser.add_argument('--screen-folds', type=int, default=2)
     parser.add_argument('--promote-trials', type=int, default=3)
     parser.add_argument('--max-rounds', type=int, default=3500)
@@ -906,6 +1031,8 @@ def main():
         parser.error('Invalid candidate filtering thresholds')
     if not 1 <= args.screen_folds <= 4 or args.promote_trials < 1:
         parser.error('screen-folds must be 1..4 and promote-trials must be positive')
+    if not args.final_seeds or len(set(args.final_seeds)) != len(args.final_seeds):
+        parser.error('final-seeds must be a non-empty unique list')
     args.gpu_ids = require_t4_pair(args.gpu_ids)
     try:
         globals()[args.command](args)
