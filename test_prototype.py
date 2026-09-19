@@ -1,7 +1,33 @@
 import numpy as np
 import pandas as pd
 import pytest
+import sys
+from types import SimpleNamespace
 from prototype import Features, split_plan, fit_model, predict, defaults, blend_weights
+
+
+def test_realmlp_uses_auc_validation_and_fixed_epoch_refit(monkeypatch):
+    calls = []
+    class FakeRealMLP:
+        def __init__(self, **kwargs):
+            self.options = kwargs
+            self.fit_params_ = {'stop_epoch': {'0': 17}}
+            calls.append(self)
+        def fit(self, *args):
+            self.fit_args = args
+        def predict_proba(self, x):
+            return np.column_stack([np.full(len(x), .4), np.full(len(x), .6)])
+    monkeypatch.setitem(sys.modules, 'pytabkit', SimpleNamespace(RealMLP_TD_Classifier=FakeRealMLP))
+    x = pd.DataFrame({'value': [0., 1., 2., 3.]})
+    y = np.array([0, 1, 0, 1])
+    cfg = dict(max_rounds=100, early_stopping=10, threads=2, realmlp_device='cuda')
+    model, rounds = fit_model('realmlp', defaults('realmlp'), x.iloc[:2], y[:2],
+                              (x.iloc[2:], y[2:]), 42, cfg)
+    assert rounds == 17 and model.options['device'] == 'cuda:0'
+    assert model.options['val_metric_name'] == '1-auc_ovr' and model.options['use_ls'] is False
+    refit, fixed = fit_model('realmlp', defaults('realmlp'), x, y, None, 42, cfg, rounds)
+    assert fixed == 17 and refit.options['stop_epoch'] == 17 and refit.options['val_fraction'] == 0
+    np.testing.assert_allclose(predict(refit, x, 'realmlp'), .6)
 
 
 def test_sealed_is_absent_from_all_development_training_and_validation():
