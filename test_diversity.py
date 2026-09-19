@@ -29,6 +29,24 @@ def test_rank_blend_is_fold_local_and_requires_three_fold_wins():
     assert not allowed and wins == 2
 
 
+def test_domain_candidate_is_cuda_safe_and_gpu_primary_needs_three_wins():
+    candidate = d.domain_anchor()
+    assert candidate['device'] == 'cuda'
+    assert candidate['params']['max_bin'] <= d.p.LGB_CUDA_BIN_LIMIT
+    y = np.tile([0, 1], 8)
+    cv = [(None, np.arange(start, start + 4)) for start in range(0, 16, 4)]
+    reference = np.array([.4, .6, .7, .3] * 4)
+    stronger = reference.copy()
+    for fold in range(3):
+        iv = cv[fold][1]
+        stronger[iv] = np.array([.1, .9, .2, .8])
+    gate = d.gpu_primary_gate(y, stronger, reference, np.arange(16), cv)
+    assert gate['allowed'] and gate['fold_wins'] == 3
+    stronger[cv[2][1]] = reference[cv[2][1]]
+    gate = d.gpu_primary_gate(y, stronger, reference, np.arange(16), cv)
+    assert not gate['allowed'] and gate['fold_wins'] == 2
+
+
 def test_changed_frozen_weights_cannot_be_audited_again(tmp_path):
     d.p.write_json(tmp_path / 'config.json', {'seed': 2026})
     frozen = dict(config_sha256=d.p.digest(tmp_path / 'config.json'), weights=[1.0])
@@ -323,7 +341,8 @@ def test_domain_can_be_primary_but_original_anchor_remains_audit_baseline(tmp_pa
         oof = values.copy()
         oof[sealed] = np.nan
         np.save(folder / f'{name}.npy', oof)
-        record = dict(d.anchor(), name=name, variant='multiscale_domain' if name == 'domain' else 'multiscale_dual',
+        template = d.domain_anchor() if name == 'domain' else d.anchor()
+        record = dict(template,
             dev_auc=float(d.roc_auc_score(y[dev], oof[dev])), rounds=[4] * 4, fixed_rounds=4,
             oof_sha256=d.p.digest(folder / f'{name}.npy'))
         d.p.write_json(folder / f'{name}.json', record)
@@ -332,6 +351,18 @@ def test_domain_can_be_primary_but_original_anchor_remains_audit_baseline(tmp_pa
     frozen = d.p.read_json(tmp_path / 'frozen.json')
     assert frozen['candidates'][0]['name'] == 'domain' and frozen['weights'] == [1.0]
     assert frozen['baseline']['name'] == 'main'
+
+
+def test_runtime_profile_sums_worker_metadata(tmp_path):
+    folder = tmp_path / 'cache' / 'predictions'
+    folder.mkdir(parents=True)
+    for index, hit in enumerate((False, True)):
+        d.p.write_json(folder / f'{index}.json', dict(candidate='lgb_0', family='lgb', device='cuda',
+            phase='dev', fold=index, feature_cache_hit=hit,
+            prepare_seconds=1.25, fit_predict_seconds=2.5))
+    d.write_runtime_profile(tmp_path)
+    group = d.p.read_json(tmp_path / 'runtime_profile.json')['groups']['cuda:lgb:dev']
+    assert group == dict(jobs=2, feature_cache_hits=1, prepare_seconds=2.5, fit_predict_seconds=5.0)
 
 
 def test_gpu_preflight_uses_same_isolated_selector_as_worker(tmp_path, monkeypatch):

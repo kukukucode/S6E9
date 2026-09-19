@@ -79,6 +79,12 @@ def cat_anchor():
                 params=p.defaults('cat'), device='cuda')
 
 
+def domain_anchor():
+    params = dict(anchor()['params'], max_bin=p.LGB_CUDA_BIN_LIMIT)
+    return dict(name='domain', lane='domain', family='lgb', variant='multiscale_domain',
+                params=params, device='cuda')
+
+
 def suggest(trial, lane):
     if lane == 'lgb':
         depth = trial.suggest_int('max_depth', 4, 7)
@@ -180,6 +186,8 @@ def worker(path, data_state=None):
             np.save(stream, prediction, allow_pickle=False)
         temporary.replace(output)
         p.write_json(output.with_suffix('.json'), dict(sha256=p.digest(output), rounds=max(1, int(rounds)),
+            candidate=candidate['name'], family=candidate['family'], device=candidate['device'],
+            phase=phase, fold=fold,
             validation_rows=len(iv), test_rows=0 if phase == 'dev' else len(te), feature_cache_hit=cache_hit,
             prepare_seconds=prepared_at-started, fit_predict_seconds=time.perf_counter()-prepared_at,
             feature_cache_bytes=cache.stat().st_size))
@@ -296,6 +304,26 @@ def shutdown_gpu_workers():
     if _GPU_POOL is not None:
         _GPU_POOL.shutdown()
         _GPU_POOL = None
+
+
+def write_runtime_profile(run):
+    groups = {}
+    for path in (Path(run) / 'cache' / 'predictions').glob('*.json'):
+        record = p.read_json(path)
+        if 'prepare_seconds' not in record or 'fit_predict_seconds' not in record:
+            continue
+        name = f"{record.get('device', 'unknown')}:{record.get('family', 'unknown')}:{record.get('phase', 'unknown')}"
+        group = groups.setdefault(name, dict(jobs=0, feature_cache_hits=0,
+            prepare_seconds=0., fit_predict_seconds=0.))
+        group['jobs'] += 1
+        group['feature_cache_hits'] += int(record.get('feature_cache_hit', False))
+        group['prepare_seconds'] += float(record['prepare_seconds'])
+        group['fit_predict_seconds'] += float(record['fit_predict_seconds'])
+    for group in groups.values():
+        group['prepare_seconds'] = round(group['prepare_seconds'], 3)
+        group['fit_predict_seconds'] = round(group['fit_predict_seconds'], 3)
+    p.write_json(Path(run) / 'runtime_profile.json', dict(
+        note='Summed worker time; parallel jobs overlap in wall-clock time.', groups=groups))
 
 
 def folds(args, cfg, candidate, phase, requested):
@@ -458,7 +486,7 @@ def search(args):
     if not (run / 'candidates/main.json').exists():
         evaluate(args, cfg, anchor())
     if args.domain_compare and not (run / 'candidates/domain.json').exists():
-        evaluate(args, cfg, dict(anchor(), name='domain', lane='domain', variant='multiscale_domain'))
+        evaluate(args, cfg, domain_anchor())
     for lane, budget in [('lgb', args.lgb_trials), ('xgb', args.xgb_trials)]:
         if budget == 0:
             continue
@@ -518,6 +546,7 @@ def search(args):
         manifest['lanes']['cat'] = ['cat_fixed']
         p.write_json(manifest_path, manifest)
     write_screen_diagnostics(run)
+    write_runtime_profile(run)
     print('Search complete. No holdout labels used.', flush=True)
 
 
@@ -581,6 +610,17 @@ def rank_blend_allowed(probability_auc, rank_auc, probability_folds, rank_folds)
     return rank_auc > probability_auc + 1e-6 and wins >= 3, wins
 
 
+def gpu_primary_gate(y, candidate, reference, dev, cv):
+    candidate_auc = float(roc_auc_score(y[dev], candidate[dev]))
+    reference_auc = float(roc_auc_score(y[dev], reference[dev]))
+    candidate_folds = fold_auc_scores(y, candidate, cv)
+    reference_folds = fold_auc_scores(y, reference, cv)
+    wins = sum(left > right + 1e-6 for left, right in zip(candidate_folds, reference_folds))
+    return dict(allowed=candidate_auc > reference_auc + 1e-6 and wins >= 3,
+        auc=candidate_auc, baseline_auc=reference_auc, fold_wins=wins,
+        fold_auc=candidate_folds, baseline_fold_auc=reference_folds)
+
+
 def freeze(args):
     run, cfg, tr, te, sub, id_col, cols, y, (dev, sealed, cv, outer) = context(args)
     if (run / 'frozen.json').exists():
@@ -592,7 +632,6 @@ def freeze(args):
     selected = [baseline]
     if args.domain_compare:
         selected.append(load_candidate(run, 'domain', y, dev, sealed))
-        selected.sort(key=lambda pair: pair[0]['dev_auc'], reverse=True)
     manifest_path = run / 'promoted.json'
     manifest = p.read_json(manifest_path) if manifest_path.exists() else {'lanes': {}}
     # Only the latest explicit promotion set can be selected.
@@ -626,9 +665,19 @@ def freeze(args):
             redundant = any(np.corrcoef(oof[dev], other[dev])[0, 1] > args.max_corr and
                 np.corrcoef(rankdata(oof[dev]), rankdata(other[dev]))[0, 1] > args.max_corr
                 for _, other in selected)
-            if not redundant:
+            gpu_replacement = (record.get('device') == 'cuda' and
+                gpu_primary_gate(y, oof, baseline[1], dev, cv)['allowed'])
+            if not redundant or gpu_replacement:
                 selected.append((record, oof))
                 kept += 1
+    gates = {record['name']: gpu_primary_gate(y, oof, baseline[1], dev, cv)
+             for record, oof in selected if record.get('device') == 'cuda'}
+    eligible = [(record, oof) for record, oof in selected
+                if gates.get(record['name'], {}).get('allowed')]
+    primary = max(eligible, key=lambda pair: pair[0]['dev_auc']) if eligible else baseline
+    selected = [primary] + [pair for pair in selected if pair[0]['name'] != primary[0]['name']]
+    p.write_json(run / 'gpu_primary_selection.json', dict(cpu_baseline=baseline[0]['name'],
+        chosen_primary=primary[0]['name'], required_fold_wins=3, candidates=gates))
     matrix = np.column_stack([oof for _, oof in selected])
     rank_matrix = rank_oof_matrix(matrix, cv)
     best = {}
@@ -657,7 +706,7 @@ def freeze(args):
     chosen = [(c, float(w)) for (c, _), w in zip(selected, winner['weights']) if w > 0]
     p.write_json(run / 'frozen.json', dict(candidates=[c for c, _ in chosen], weights=[w for _, w in chosen],
         mode=mode, development_selection_auc=winner['auc'], development_fold_auc=winner['fold_auc'],
-        rank_fold_wins=rank_wins, baseline=baseline[0],
+        rank_fold_wins=rank_wins, primary=primary[0]['name'], baseline=baseline[0],
         config_sha256=p.digest(run / 'config.json'),
         note='Weights selected only on development OOF. Selection-biased; no Public LB tuning.'))
     print(f'Frozen {mode} blend; dev AUC={winner["auc"]:.7f}; weights={[w for _, w in chosen]}', flush=True)
@@ -686,6 +735,7 @@ def audit(args):
     p.write_json(run / 'sealed_report.json', dict(sealed_auc=float(roc_auc_score(y[sealed], pred)),
         baseline_auc=float(roc_auc_score(y[sealed], baseline)), public_lb=None,
         note='Previously reviewed holdout split: reference only, not a fresh independent evaluation. Do not retune.'))
+    write_runtime_profile(run)
     print(p.read_json(run / 'sealed_report.json'), flush=True)
 
 
@@ -718,6 +768,7 @@ def finalize(args):
     p.write_json(run / 'final_report.json', dict(final_oof_auc=float(roc_auc_score(y, oof)),
         public_lb=None, submission_sha256=p.digest(run / 'submission.csv'),
         note='OOF includes candidate/weight selection bias. Public LB remains unmeasured.'))
+    write_runtime_profile(run)
     print(f'Created {run / "submission.csv"}', flush=True)
 
 
@@ -726,7 +777,7 @@ def main():
     parser.add_argument('command', choices=['search', 'freeze', 'audit', 'finalize', 'worker', 'worker-loop'])
     parser.add_argument('--job')
     parser.add_argument('--data', default='/kaggle/input/competitions/playground-series-s6e9')
-    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_5')
+    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_6')
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--threads', type=int, default=4, help='Total CPU budget across concurrent folds')
     parser.add_argument('--gpu-ids', nargs='+', default=None, help='Two physical T4 IDs/UUIDs; default auto-detect')
