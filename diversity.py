@@ -610,6 +610,52 @@ def rank_blend_allowed(probability_auc, rank_auc, probability_folds, rank_folds)
     return rank_auc > probability_auc + 1e-6 and wins >= 3, wins
 
 
+def tie_break_allowed(base_auc, tie_auc, base_folds, tie_folds):
+    wins = sum(tie > base for base, tie in zip(base_folds, tie_folds))
+    return tie_auc > base_auc and wins >= 3, wins
+
+
+def lexicographic_rank(primary, secondary):
+    primary, secondary = np.asarray(primary), np.asarray(secondary)
+    if primary.ndim != 1 or primary.shape != secondary.shape or not len(primary):
+        raise ValueError('Tie-breaking inputs must be non-empty aligned vectors')
+    if not np.isfinite(primary).all() or not np.isfinite(secondary).all():
+        raise ValueError('Tie-breaking inputs must be finite')
+    order = np.lexsort((secondary, primary))
+    ordered_primary, ordered_secondary = primary[order], secondary[order]
+    starts = np.r_[0, 1 + np.flatnonzero(
+        (ordered_primary[1:] != ordered_primary[:-1]) |
+        (ordered_secondary[1:] != ordered_secondary[:-1]))]
+    ends = np.r_[starts[1:], len(primary)]
+    average_ranks = (starts + 1 + ends) / 2
+    ranked = np.empty(len(primary), dtype=float)
+    ranked[order] = np.repeat(average_ranks, ends - starts)
+    return (ranked - .5) / len(primary)
+
+
+def lexicographic_oof(primary, secondary, cv):
+    result = np.full(len(primary), np.nan, dtype=float)
+    development = np.concatenate([iv for _, iv in cv])
+    result[development] = lexicographic_rank(primary[development], secondary[development])
+    return result
+
+
+def fold_tie_statistics(primary, cv):
+    development = np.concatenate([iv for _, iv in cv])
+    counts = np.unique(primary[development], return_counts=True)[1]
+    tied = counts[counts > 1]
+    per_fold = []
+    for fold, (_, iv) in enumerate(cv):
+        counts = np.unique(primary[iv], return_counts=True)[1]
+        fold_ties = counts[counts > 1]
+        item = dict(fold=fold, rows=len(iv), tied_rows=int(fold_ties.sum()),
+            tie_groups=int(len(fold_ties)), largest_tie=int(fold_ties.max()) if len(fold_ties) else 1)
+        per_fold.append(item)
+    return dict(rows=len(development), tied_rows=int(tied.sum()),
+        tied_fraction=float(tied.sum() / len(development)), tie_groups=int(len(tied)),
+        largest_tie=int(tied.max()) if len(tied) else 1, per_fold=per_fold)
+
+
 def gpu_primary_gate(y, candidate, reference, dev, cv):
     candidate_auc = float(roc_auc_score(y[dev], candidate[dev]))
     reference_auc = float(roc_auc_score(y[dev], reference[dev]))
@@ -630,8 +676,11 @@ def freeze(args):
         raise RuntimeError('Holdout already opened; cannot select candidates again.')
     baseline = load_candidate(run, 'main', y, dev, sealed)
     selected = [baseline]
+    tie_pool = [baseline]
     if args.domain_compare:
-        selected.append(load_candidate(run, 'domain', y, dev, sealed))
+        domain = load_candidate(run, 'domain', y, dev, sealed)
+        selected.append(domain)
+        tie_pool.append(domain)
     manifest_path = run / 'promoted.json'
     manifest = p.read_json(manifest_path) if manifest_path.exists() else {'lanes': {}}
     # Only the latest explicit promotion set can be selected.
@@ -657,6 +706,7 @@ def freeze(args):
         if not records:
             continue
         records.sort(key=lambda pair: pair[0]['dev_auc'], reverse=True)
+        tie_pool.extend(records)
         kept = 0
         for record, oof in records:
             if record['dev_auc'] < records[0][0]['dev_auc'] - args.auc_window or kept >= limit:
@@ -694,6 +744,27 @@ def freeze(args):
         best['probability']['fold_auc'], best['rank']['fold_auc'])
     mode = 'rank' if allowed else 'probability'
     winner = best[mode]
+    blend_matrix = rank_matrix if mode == 'rank' else matrix
+    base_oof = blend_matrix @ winner['weights']
+    tie_trials = []
+    for record, oof in tie_pool:
+        prediction = lexicographic_oof(base_oof, oof, cv)
+        score = float(roc_auc_score(y[dev], prediction[dev]))
+        scores = fold_auc_scores(y, prediction, cv)
+        accepted, wins = tie_break_allowed(winner['auc'], score, winner['fold_auc'], scores)
+        tie_trials.append(dict(candidate=record, auc=score, fold_auc=scores,
+                               fold_wins=wins, accepted=accepted))
+    accepted = [trial for trial in tie_trials if trial['accepted']]
+    tie_winner = max(accepted, key=lambda trial: trial['auc']) if accepted else None
+    tie_breaker = None if tie_winner is None else dict(candidate=tie_winner['candidate'],
+        auc=tie_winner['auc'], fold_auc=tie_winner['fold_auc'], fold_wins=tie_winner['fold_wins'])
+    p.write_json(run / 'tie_break_comparison.json', dict(
+        base_auc=winner['auc'], base_fold_auc=winner['fold_auc'],
+        tie_statistics=fold_tie_statistics(base_oof, cv), required_fold_wins=3,
+        candidates=[dict(name=trial['candidate']['name'], auc=trial['auc'],
+            fold_auc=trial['fold_auc'], fold_wins=trial['fold_wins'], accepted=trial['accepted'])
+            for trial in tie_trials],
+        chosen=None if tie_winner is None else tie_winner['candidate']['name']))
     p.write_json(run / 'blend_comparison.json', dict(
         candidates=[c['name'] for c, _ in selected],
         probability=dict(auc=best['probability']['auc'], weights=best['probability']['weights'].tolist(),
@@ -704,12 +775,17 @@ def freeze(args):
     p.write_json(run / 'candidate_correlation.json', dict(names=[c['name'] for c, _ in selected],
         pearson=np.nan_to_num(np.atleast_2d(np.corrcoef(matrix[dev], rowvar=False)), nan=1).tolist()))
     chosen = [(c, float(w)) for (c, _), w in zip(selected, winner['weights']) if w > 0]
+    final_auc = tie_winner['auc'] if tie_winner is not None else winner['auc']
+    final_fold_auc = tie_winner['fold_auc'] if tie_winner is not None else winner['fold_auc']
     p.write_json(run / 'frozen.json', dict(candidates=[c for c, _ in chosen], weights=[w for _, w in chosen],
-        mode=mode, development_selection_auc=winner['auc'], development_fold_auc=winner['fold_auc'],
-        rank_fold_wins=rank_wins, primary=primary[0]['name'], baseline=baseline[0],
+        mode=mode, tie_breaker=tie_breaker, development_selection_auc=final_auc,
+        development_fold_auc=final_fold_auc, rank_fold_wins=rank_wins,
+        primary=primary[0]['name'], baseline=baseline[0],
         config_sha256=p.digest(run / 'config.json'),
         note='Weights selected only on development OOF. Selection-biased; no Public LB tuning.'))
-    print(f'Frozen {mode} blend; dev AUC={winner["auc"]:.7f}; weights={[w for _, w in chosen]}', flush=True)
+    tie_name = None if tie_winner is None else tie_winner['candidate']['name']
+    print(f'Frozen {mode} blend; tie_breaker={tie_name}; dev AUC={final_auc:.7f}; '
+          f'weights={[w for _, w in chosen]}', flush=True)
 
 
 def frozen_config(run):
@@ -729,8 +805,17 @@ def audit(args):
         print('Existing holdout report retained.', flush=True)
         return
     p.write_json(run / 'SEALED_OPENED.json', dict(frozen_sha256=p.digest(run / 'frozen.json')))
-    values = [folds(args, cfg, c, 'final', [4])[4][0][:len(sealed)] for c in frozen['candidates']]
-    pred = blend_values(np.column_stack(values), frozen['weights'], frozen['mode'])
+    values = {c['name']: folds(args, cfg, c, 'final', [4])[4][0][:len(sealed)]
+              for c in frozen['candidates']}
+    pred = blend_values(np.column_stack([values[c['name']] for c in frozen['candidates']]),
+                        frozen['weights'], frozen['mode'])
+    tie = frozen.get('tie_breaker')
+    if tie is not None:
+        candidate = tie['candidate']
+        secondary = values.get(candidate['name'])
+        if secondary is None:
+            secondary = folds(args, cfg, candidate, 'final', [4])[4][0][:len(sealed)]
+        pred = lexicographic_rank(pred, secondary)
     baseline = folds(args, cfg, frozen['baseline'], 'final', [4])[4][0][:len(sealed)]
     p.write_json(run / 'sealed_report.json', dict(sealed_auc=float(roc_auc_score(y[sealed], pred)),
         baseline_auc=float(roc_auc_score(y[sealed], baseline)), public_lb=None,
@@ -744,21 +829,36 @@ def finalize(args):
     frozen = frozen_config(run)
     if not (run / 'sealed_report.json').exists():
         raise ValueError('Run audit after freeze first.')
-    predictions = [folds(args, cfg, c, 'final', list(range(5))) for c in frozen['candidates']]
-    oof, test_folds = np.empty(len(y)), []
+    candidates = list(frozen['candidates'])
+    tie = frozen.get('tie_breaker')
+    if tie is not None and tie['candidate']['name'] not in {c['name'] for c in candidates}:
+        candidates.append(tie['candidate'])
+    predictions = {c['name']: folds(args, cfg, c, 'final', list(range(5))) for c in candidates}
+    oof, test_folds, test_secondary_folds = np.empty(len(y)), [], []
+    oof_secondary = np.empty(len(y)) if tie is not None else None
     for fold in range(5):
         iv = np.flatnonzero(outer == fold)
-        vm = np.column_stack([r[fold][0][:len(iv)] for r in predictions])
-        tm = np.column_stack([r[fold][0][len(iv):] for r in predictions])
-        oof[iv] = blend_values(vm, frozen['weights'], frozen['mode'])
-        test_folds.append(blend_values(tm, frozen['weights'], frozen['mode']))
+        vm = np.column_stack([predictions[c['name']][fold][0][:len(iv)] for c in frozen['candidates']])
+        tm = np.column_stack([predictions[c['name']][fold][0][len(iv):] for c in frozen['candidates']])
+        valid_blend = blend_values(vm, frozen['weights'], frozen['mode'])
+        test_blend = blend_values(tm, frozen['weights'], frozen['mode'])
+        if tie is not None:
+            secondary = predictions[tie['candidate']['name']][fold][0]
+            oof_secondary[iv] = secondary[:len(iv)]
+            test_secondary_folds.append(secondary[len(iv):])
+        oof[iv] = valid_blend
+        test_folds.append(test_blend)
     test = np.mean(test_folds, axis=0)
+    if tie is not None:
+        oof = lexicographic_rank(oof, oof_secondary)
+        test = lexicographic_rank(test, np.mean(test_secondary_folds, axis=0))
     sub[p.TARGET] = sub[id_col].map(pd.Series(test, index=te[id_col]))
     if sub[p.TARGET].isna().any() or not sub[p.TARGET].between(0, 1).all():
         raise ValueError('Invalid submission probabilities or ID alignment')
     sub.to_csv(run / 'submission.csv', index=False)
     result = pd.DataFrame({id_col: tr[id_col], p.TARGET: y, 'fold': outer, 'prediction': oof})
-    for c, model_predictions in zip(frozen['candidates'], predictions):
+    for c in candidates:
+        model_predictions = predictions[c['name']]
         raw_oof = np.empty(len(y))
         for fold in range(5):
             iv = np.flatnonzero(outer == fold)
@@ -777,7 +877,7 @@ def main():
     parser.add_argument('command', choices=['search', 'freeze', 'audit', 'finalize', 'worker', 'worker-loop'])
     parser.add_argument('--job')
     parser.add_argument('--data', default='/kaggle/input/competitions/playground-series-s6e9')
-    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_6')
+    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_7')
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--threads', type=int, default=4, help='Total CPU budget across concurrent folds')
     parser.add_argument('--gpu-ids', nargs='+', default=None, help='Two physical T4 IDs/UUIDs; default auto-detect')

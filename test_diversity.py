@@ -29,6 +29,23 @@ def test_rank_blend_is_fold_local_and_requires_three_fold_wins():
     assert not allowed and wins == 2
 
 
+def test_lexicographic_rank_changes_only_primary_ties():
+    primary = np.array([.1, .2, .2, .2, .3, .4, .4])
+    secondary = np.array([.5, .1, .9, .5, .2, .3, .3])
+    ranked = d.lexicographic_rank(primary, secondary)
+    assert ranked[0] < min(ranked[1:4]) < max(ranked[1:4]) < ranked[4] < ranked[5]
+    assert ranked[1] < ranked[3] < ranked[2]
+    assert ranked[5] == ranked[6]
+    stats = d.fold_tie_statistics(primary, [(None, np.arange(len(primary)))])
+    assert stats['tied_rows'] == 5 and stats['tie_groups'] == 2 and stats['largest_tie'] == 3
+    global_oof = d.lexicographic_oof(np.array([.1, .4, .2, .3]), np.arange(4),
+                                    [(None, np.array([0, 1])), (None, np.array([2, 3]))])
+    assert global_oof[0] < global_oof[2] < global_oof[3] < global_oof[1]
+    allowed, wins = d.tie_break_allowed(.8, .8000001, [.7, .7, .7, .7],
+                                        [.7000001, .7000001, .7000001, .6999999])
+    assert allowed and wins == 3
+
+
 def test_domain_candidate_is_cuda_safe_and_gpu_primary_needs_three_wins():
     candidate = d.domain_anchor()
     assert candidate['device'] == 'cuda'
