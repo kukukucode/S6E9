@@ -18,6 +18,17 @@ def test_micro_blend_keeps_baseline_and_convex_probabilities():
         assert np.count_nonzero(weights[1:]) <= 2
 
 
+def test_rank_blend_is_fold_local_and_requires_three_fold_wins():
+    matrix = np.array([[.1, .9], [.2, .8], [.8, .2], [.9, .1]])
+    cv = [(None, np.array([0, 1])), (None, np.array([2, 3]))]
+    ranked = d.rank_oof_matrix(matrix, cv)
+    np.testing.assert_allclose(ranked, [[.25, .75], [.75, .25], [.25, .75], [.75, .25]])
+    allowed, wins = d.rank_blend_allowed(.80, .81, [.70, .71, .72, .73], [.71, .72, .73, .72])
+    assert allowed and wins == 3
+    allowed, wins = d.rank_blend_allowed(.80, .81, [.70, .71, .72, .73], [.71, .72, .71, .72])
+    assert not allowed and wins == 2
+
+
 def test_changed_frozen_weights_cannot_be_audited_again(tmp_path):
     d.p.write_json(tmp_path / 'config.json', {'seed': 2026})
     frozen = dict(config_sha256=d.p.digest(tmp_path / 'config.json'), weights=[1.0])
@@ -222,7 +233,7 @@ def test_screen_evaluation_reuses_predictions_when_promoted(tmp_path, monkeypatc
 
 def test_search_screens_every_trial_and_promotes_only_top_three(tmp_path, monkeypatch):
     args = Namespace(run=str(tmp_path), seed=2026, lgb_trials=4, xgb_trials=0,
-        screen_folds=2, promote_trials=3, domain_compare=False)
+        screen_folds=2, promote_trials=3, domain_compare=False, cat_compare=False)
     monkeypatch.setattr(d, 'context', lambda args: (tmp_path, {}))
     calls = []
     def fake_evaluate(args, cfg, candidate, requested=None, stage='full'):
@@ -234,6 +245,8 @@ def test_search_screens_every_trial_and_promotes_only_top_three(tmp_path, monkey
         previous = d.p.read_json(path) if path.exists() else {}
         d.p.write_json(path, dict(candidate, stage=stage,
             screen_auc=score if stage == 'screen' else previous.get('screen_auc'),
+            screen_fold_auc={'0': score, '1': score} if stage == 'screen' else previous.get('screen_fold_auc'),
+            full_fold_auc={str(i): score for i in range(4)} if stage == 'full' else None,
             dev_auc=score if stage == 'full' else None))
         return score
     monkeypatch.setattr(d, 'evaluate', fake_evaluate)
@@ -243,6 +256,34 @@ def test_search_screens_every_trial_and_promotes_only_top_three(tmp_path, monkey
         'lgb_1', 'lgb_2', 'lgb_3'}
     assert all(folds == [0, 1] for _, folds, stage in calls if stage == 'screen')
     assert d.p.read_json(tmp_path / 'promoted.json')['lanes']['lgb'] == ['lgb_3', 'lgb_2', 'lgb_1']
+    diagnostics = d.p.read_json(tmp_path / 'screen_promotion_diagnostics.json')['lanes']['lgb']
+    assert diagnostics['promoted_count'] == 3 and diagnostics['rank_correlation'] == pytest.approx(1)
+
+
+def test_search_evaluates_one_fixed_catboost_candidate(tmp_path, monkeypatch):
+    args = Namespace(run=str(tmp_path), seed=2026, lgb_trials=0, xgb_trials=0,
+        screen_folds=2, promote_trials=3, domain_compare=False, cat_compare=True)
+    monkeypatch.setattr(d, 'context', lambda args: (tmp_path, {}))
+    calls = []
+    def fake_evaluate(args, cfg, candidate, requested=None, stage='full'):
+        requested = [0, 1, 2, 3] if requested is None else requested
+        calls.append((candidate['name'], list(requested), stage, candidate['device']))
+        path = tmp_path / 'candidates' / f"{candidate['name']}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        previous = d.p.read_json(path) if path.exists() else {}
+        score = .6
+        d.p.write_json(path, dict(candidate, stage=stage,
+            screen_auc=score if stage == 'screen' else previous.get('screen_auc'),
+            screen_fold_auc={'0': score, '1': score} if stage == 'screen' else previous.get('screen_fold_auc'),
+            full_fold_auc={str(i): score for i in range(4)} if stage == 'full' else None,
+            dev_auc=score if stage == 'full' else None))
+        return score
+    monkeypatch.setattr(d, 'evaluate', fake_evaluate)
+    d.search(args)
+    assert [call for call in calls if call[0] == 'cat_fixed'] == [
+        ('cat_fixed', [0, 1], 'screen', 'cuda'),
+        ('cat_fixed', [0, 1, 2, 3], 'full', 'cuda')]
+    assert d.p.read_json(tmp_path / 'promoted.json')['lanes']['cat'] == ['cat_fixed']
 
 
 def test_freeze_ignores_old_full_candidates_outside_promotion_manifest(tmp_path, monkeypatch):
