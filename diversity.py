@@ -32,7 +32,8 @@ def context(args):
     settings = dict(seed=args.seed, threads=args.threads, gpu_ids=args.gpu_ids,
         parallel_folds=2, max_rounds=args.max_rounds,
         early_stopping=args.early_stopping, auc_window=args.auc_window, max_corr=args.max_corr,
-        domain_compare=args.domain_compare,
+        domain_compare=args.domain_compare, screen_folds=args.screen_folds,
+        promote_trials=args.promote_trials,
         hashes={f: p.digest(Path(args.data) / f) for f in ('train.csv', 'test.csv', 'sample_submission.csv')},
         sources={f: p.digest(Path(__file__).with_name(f)) for f in ('prototype.py', 'diversity.py', 'gpu_setup.py')},
         versions={name: importlib.metadata.version(name) for name in
@@ -232,21 +233,32 @@ def folds(args, cfg, candidate, phase, requested):
     return results
 
 
-def evaluate(args, cfg, candidate):
-    result = folds(args, cfg, candidate, 'dev', list(range(4)))
+def evaluate(args, cfg, candidate, requested=None, stage='full'):
+    requested = list(range(4)) if requested is None else sorted(set(requested))
+    if not requested or any(fold not in range(4) for fold in requested):
+        raise ValueError('Development folds must be a non-empty subset of 0..3')
+    if stage not in ('screen', 'full'):
+        raise ValueError('Evaluation stage must be screen or full')
+    result = folds(args, cfg, candidate, 'dev', requested)
     y, (dev, _, cv, _) = args._data[5], args._data[6]
     oof = np.full(len(y), np.nan)
-    for fold, (_, iv) in enumerate(cv):
-        oof[iv] = result[fold][0]
-    rounds = [result[f][1]['rounds'] for f in range(4)]
-    record = dict(candidate, dev_auc=float(roc_auc_score(y[dev], oof[dev])),
-        fixed_rounds=int(np.median(rounds)), rounds=rounds)
+    for fold in requested:
+        oof[cv[fold][1]] = result[fold][0]
+    scored = np.concatenate([cv[fold][1] for fold in requested])
+    score = float(roc_auc_score(y[scored], oof[scored]))
+    rounds = [result[fold][1]['rounds'] for fold in requested]
     path = Path(args.run) / 'candidates' / candidate['name']
+    previous = p.read_json(path.with_suffix('.json')) if path.with_suffix('.json').exists() else {}
+    record = dict(candidate, stage=stage,
+        screen_folds=requested if stage == 'screen' else previous.get('screen_folds'),
+        screen_auc=score if stage == 'screen' else previous.get('screen_auc'),
+        dev_auc=score if stage == 'full' else None,
+        fixed_rounds=int(np.median(rounds)), rounds=rounds)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path.with_suffix('.npy'), oof)
     record['oof_sha256'] = p.digest(path.with_suffix('.npy'))
     p.write_json(path.with_suffix('.json'), record)
-    return record['dev_auc']
+    return score
 
 
 def search(args):
@@ -280,11 +292,24 @@ def search(args):
         done = sum(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
         def objective(trial):
             try:
-                return evaluate(args, cfg, suggest(trial, lane))
+                return evaluate(args, cfg, suggest(trial, lane),
+                    requested=list(range(args.screen_folds)), stage='screen')
             except BaseException:
                 trial.set_user_attr('retry_pending', True)
                 raise
         study.optimize(objective, n_trials=max(0, budget - done))
+        complete = sorted((trial for trial in study.trials
+            if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None),
+            key=lambda trial: trial.value, reverse=True)
+        for trial in complete[:min(args.promote_trials, len(complete))]:
+            path = run / 'candidates' / f'{lane}_{trial.number}.json'
+            record = p.read_json(path)
+            if record.get('stage') == 'full':
+                continue
+            candidate = {name: record[name]
+                         for name in ('name', 'lane', 'family', 'variant', 'params', 'device')}
+            print(f'Promoting {candidate["name"]} to full 4-fold CV', flush=True)
+            evaluate(args, cfg, candidate, requested=list(range(4)), stage='full')
     print('Search complete. No holdout labels used.', flush=True)
 
 
@@ -334,8 +359,14 @@ def freeze(args):
         if not any((run / 'candidates').glob(f'{lane}_*.json')):
             continue
         study = optuna.load_study(study_name=lane, storage=f"sqlite:///{(run / 'optuna.db').resolve().as_posix()}")
-        records = [load_candidate(run, f'{lane}_{t.number}', y, dev, sealed)
-                   for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        complete = {f'{lane}_{trial.number}' for trial in study.trials
+                    if trial.state == optuna.trial.TrialState.COMPLETE}
+        names = [name for name in complete
+                 if (run / 'candidates' / f'{name}.json').exists()
+                 and p.read_json(run / 'candidates' / f'{name}.json').get('stage') == 'full']
+        records = [load_candidate(run, name, y, dev, sealed) for name in names]
+        if not records:
+            continue
         records.sort(key=lambda pair: pair[0]['dev_auc'], reverse=True)
         kept = 0
         for record, oof in records:
@@ -431,11 +462,13 @@ def main():
     parser.add_argument('command', choices=['search', 'freeze', 'audit', 'finalize', 'worker'])
     parser.add_argument('--job')
     parser.add_argument('--data', default='/kaggle/input/competitions/playground-series-s6e9')
-    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_2')
+    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_3')
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--threads', type=int, default=4, help='Total CPU budget across concurrent folds')
     parser.add_argument('--gpu-ids', nargs='+', default=None, help='Two physical T4 IDs/UUIDs; default auto-detect')
     parser.add_argument('--domain-compare', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--screen-folds', type=int, default=2)
+    parser.add_argument('--promote-trials', type=int, default=3)
     parser.add_argument('--max-rounds', type=int, default=3500)
     parser.add_argument('--early-stopping', type=int, default=120)
     parser.add_argument('--lgb-trials', type=int, default=12)
@@ -452,6 +485,8 @@ def main():
         parser.error('Invalid budgets')
     if not 0 < args.max_corr <= 1 or args.auc_window < 0 or args.auc_window > 1:
         parser.error('Invalid candidate filtering thresholds')
+    if not 1 <= args.screen_folds <= 4 or args.promote_trials < 1:
+        parser.error('screen-folds must be 1..4 and promote-trials must be positive')
     args.gpu_ids = require_t4_pair(args.gpu_ids)
     globals()[args.command](args)
 

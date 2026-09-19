@@ -173,6 +173,54 @@ def test_two_gpu_folds_are_isolated_and_complete_predictions_are_reused(tmp_path
     assert calls == [([0, 1, 2, 3], '', 4)]
 
 
+def test_screen_evaluation_reuses_predictions_when_promoted(tmp_path, monkeypatch):
+    y = np.tile([0, 1], 100)
+    split = d.p.split_plan(y)
+    dev, sealed, cv, _ = split
+    args = Namespace(run=str(tmp_path), _data=(None, None, None, None, None, y, split))
+    calls = []
+    def fake_folds(args, cfg, candidate, phase, requested):
+        calls.append(list(requested))
+        return {fold: (.1 + .8 * y[cv[fold][1]], {'rounds': 10 + fold}) for fold in requested}
+    monkeypatch.setattr(d, 'folds', fake_folds)
+    candidate = d.anchor()
+    assert d.evaluate(args, {}, candidate, [0, 1], 'screen') == 1
+    screen = d.p.read_json(tmp_path / 'candidates' / 'main.json')
+    assert screen['stage'] == 'screen' and screen['screen_folds'] == [0, 1]
+    assert screen['dev_auc'] is None
+    partial = np.load(tmp_path / 'candidates' / 'main.npy')
+    assert np.isfinite(partial[np.concatenate([cv[0][1], cv[1][1]])]).all()
+    assert np.isnan(partial[np.concatenate([cv[2][1], cv[3][1], sealed])]).all()
+    assert d.evaluate(args, {}, candidate, [0, 1, 2, 3], 'full') == 1
+    full = d.p.read_json(tmp_path / 'candidates' / 'main.json')
+    assert full['stage'] == 'full' and full['screen_auc'] == 1 and full['dev_auc'] == 1
+    assert calls == [[0, 1], [0, 1, 2, 3]]
+
+
+def test_search_screens_every_trial_and_promotes_only_top_three(tmp_path, monkeypatch):
+    args = Namespace(run=str(tmp_path), seed=2026, lgb_trials=4, xgb_trials=0,
+        screen_folds=2, promote_trials=3, domain_compare=False)
+    monkeypatch.setattr(d, 'context', lambda args: (tmp_path, {}))
+    calls = []
+    def fake_evaluate(args, cfg, candidate, requested=None, stage='full'):
+        requested = [0, 1, 2, 3] if requested is None else requested
+        calls.append((candidate['name'], list(requested), stage))
+        score = .5 if candidate['name'] == 'main' else .5 + int(candidate['name'].split('_')[1]) / 100
+        path = tmp_path / 'candidates' / f"{candidate['name']}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        previous = d.p.read_json(path) if path.exists() else {}
+        d.p.write_json(path, dict(candidate, stage=stage,
+            screen_auc=score if stage == 'screen' else previous.get('screen_auc'),
+            dev_auc=score if stage == 'full' else None))
+        return score
+    monkeypatch.setattr(d, 'evaluate', fake_evaluate)
+    d.search(args)
+    assert [name for name, folds, stage in calls if stage == 'screen'] == [f'lgb_{i}' for i in range(4)]
+    assert {name for name, folds, stage in calls if stage == 'full' and name.startswith('lgb_')} == {
+        'lgb_1', 'lgb_2', 'lgb_3'}
+    assert all(folds == [0, 1] for _, folds, stage in calls if stage == 'screen')
+
+
 def test_domain_can_be_primary_but_original_anchor_remains_audit_baseline(tmp_path, monkeypatch):
     y = np.tile([0, 1], 100)
     split = d.p.split_plan(y)
