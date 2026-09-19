@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import importlib.metadata
 import itertools
@@ -33,7 +34,7 @@ def context(args):
     settings = dict(seed=args.seed, threads=args.threads, gpu_ids=args.gpu_ids,
         parallel_folds=2, max_rounds=args.max_rounds,
         early_stopping=args.early_stopping, auc_window=args.auc_window, max_corr=args.max_corr,
-        domain_compare=args.domain_compare, screen_folds=args.screen_folds,
+        domain_compare=args.domain_compare, cat_compare=args.cat_compare, screen_folds=args.screen_folds,
         promote_trials=args.promote_trials,
         hashes={f: p.digest(Path(args.data) / f) for f in ('train.csv', 'test.csv', 'sample_submission.csv')},
         sources={f: p.digest(Path(__file__).with_name(f)) for f in ('prototype.py', 'diversity.py', 'gpu_setup.py')},
@@ -71,6 +72,11 @@ def anchor():
         colsample_bytree=.5, reg_alpha=.07, reg_lambda=2., max_bin=511)
     return dict(name='main', lane='main', family='lgb', variant='multiscale_dual',
                 params=params, device='cpu')
+
+
+def cat_anchor():
+    return dict(name='cat_fixed', lane='cat', family='cat', variant='multiscale_dual',
+                params=p.defaults('cat'), device='cuda')
 
 
 def suggest(trial, lane):
@@ -154,7 +160,8 @@ def worker(path, data_state=None):
         fixed = candidate.get('fixed_rounds') if phase != 'dev' else None
         backend = dict(max_rounds=cfg['max_rounds'], early_stopping=cfg['early_stopping'],
             threads=job['threads'], lgb_device=candidate['device'], lgb_gpu_id=0,
-            xgb_device='cuda:0' if candidate['device'] == 'cuda' else 'cpu')
+            xgb_device='cuda:0' if candidate['device'] == 'cuda' else 'cpu',
+            cat_device=candidate['device'], cat_gpu_id=0)
         prepared_at = time.perf_counter()
         model, rounds = p.fit_model(candidate['family'], candidate['params'], train_x, y[it],
             valid, cfg['seed'], backend, fixed)
@@ -162,6 +169,10 @@ def worker(path, data_state=None):
             actual = json.loads(model.get_booster().save_config())['learner']['generic_param']['device']
             if not actual.startswith('cuda'):
                 raise RuntimeError(f'XGBoost did not use the requested GPU: {actual}')
+        if candidate['family'] == 'cat' and candidate['device'] == 'cuda':
+            actual = str(model.get_param('task_type') or '').upper()
+            if actual != 'GPU':
+                raise RuntimeError(f'CatBoost did not use the requested GPU: {actual}')
         prediction = p.predict(model, pred_x, candidate['family'])
         output = Path(job['outputs'][str(fold)])
         temporary = output.with_suffix('.tmp')
@@ -192,6 +203,8 @@ def worker_loop():
             print(error, file=sys.stderr, flush=True)
             if status is not None:
                 p.write_json(status, {'ok': False, 'error': error})
+        finally:
+            gc.collect()
 
 
 class GpuWorkerPool:
@@ -376,19 +389,63 @@ def evaluate(args, cfg, candidate, requested=None, stage='full'):
         oof[cv[fold][1]] = result[fold][0]
     scored = np.concatenate([cv[fold][1] for fold in requested])
     score = float(roc_auc_score(y[scored], oof[scored]))
+    fold_auc = {str(fold): float(roc_auc_score(y[cv[fold][1]], oof[cv[fold][1]]))
+                for fold in requested}
     rounds = [result[fold][1]['rounds'] for fold in requested]
     path = Path(args.run) / 'candidates' / candidate['name']
     previous = p.read_json(path.with_suffix('.json')) if path.with_suffix('.json').exists() else {}
     record = dict(candidate, stage=stage,
         screen_folds=requested if stage == 'screen' else previous.get('screen_folds'),
         screen_auc=score if stage == 'screen' else previous.get('screen_auc'),
+        screen_fold_auc=fold_auc if stage == 'screen' else previous.get('screen_fold_auc'),
         dev_auc=score if stage == 'full' else None,
+        full_fold_auc=fold_auc if stage == 'full' else None,
         fixed_rounds=int(np.median(rounds)), rounds=rounds)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path.with_suffix('.npy'), oof)
     record['oof_sha256'] = p.digest(path.with_suffix('.npy'))
     p.write_json(path.with_suffix('.json'), record)
     return score
+
+
+def write_screen_diagnostics(run):
+    """Measure whether two-fold screening preserves the promoted order."""
+    manifest_path = run / 'promoted.json'
+    if not manifest_path.exists():
+        return
+    manifest = p.read_json(manifest_path)
+    lanes = {}
+    for lane, names in manifest.get('lanes', {}).items():
+        records = []
+        for name in names:
+            path = run / 'candidates' / f'{name}.json'
+            if not path.exists():
+                continue
+            record = p.read_json(path)
+            if record.get('screen_auc') is None or record.get('dev_auc') is None:
+                continue
+            records.append(record)
+        if not records:
+            continue
+        screen_values = np.array([record['screen_auc'] for record in records], dtype=float)
+        full_values = np.array([record['dev_auc'] for record in records], dtype=float)
+        screen_ranks = rankdata(-screen_values, method='average')
+        full_ranks = rankdata(-full_values, method='average')
+        correlation = None
+        if len(records) > 1 and np.std(screen_ranks) > 0 and np.std(full_ranks) > 0:
+            correlation = float(np.corrcoef(screen_ranks, full_ranks)[0, 1])
+        entries = []
+        for record, screen_rank, full_rank in zip(records, screen_ranks, full_ranks):
+            entries.append(dict(name=record['name'], screen_auc=record['screen_auc'],
+                full_auc=record['dev_auc'], delta_auc=record['dev_auc'] - record['screen_auc'],
+                screen_rank=float(screen_rank), full_rank=float(full_rank),
+                screen_fold_auc=record.get('screen_fold_auc'),
+                full_fold_auc=record.get('full_fold_auc')))
+        lanes[lane] = dict(promoted_count=len(records), rank_correlation=correlation,
+                           candidates=entries)
+    p.write_json(run / 'screen_promotion_diagnostics.json', dict(
+        screen_folds=manifest.get('screen_folds'),
+        note='Diagnostic only; screening folds and promotion counts are unchanged.', lanes=lanes))
 
 
 def search(args):
@@ -446,6 +503,21 @@ def search(args):
             'screen_folds': args.screen_folds, 'promote_trials': args.promote_trials, 'lanes': {}}
         manifest['lanes'][lane] = [f'{lane}_{trial.number}' for trial in promoted]
         p.write_json(manifest_path, manifest)
+    if args.cat_compare:
+        candidate = cat_anchor()
+        path = run / 'candidates' / 'cat_fixed.json'
+        if not path.exists():
+            evaluate(args, cfg, candidate, requested=list(range(args.screen_folds)), stage='screen')
+        record = p.read_json(path)
+        if record.get('stage') != 'full':
+            print('Promoting cat_fixed to full 4-fold CV', flush=True)
+            evaluate(args, cfg, candidate, requested=list(range(4)), stage='full')
+        manifest_path = run / 'promoted.json'
+        manifest = p.read_json(manifest_path) if manifest_path.exists() else {
+            'screen_folds': args.screen_folds, 'promote_trials': args.promote_trials, 'lanes': {}}
+        manifest['lanes']['cat'] = ['cat_fixed']
+        p.write_json(manifest_path, manifest)
+    write_screen_diagnostics(run)
     print('Search complete. No holdout labels used.', flush=True)
 
 
@@ -478,6 +550,37 @@ def weight_grid(size):
             yield w
 
 
+def rank_columns(matrix):
+    ranked = np.empty(matrix.shape, dtype=float)
+    for column in range(matrix.shape[1]):
+        ranked[:, column] = (rankdata(matrix[:, column], method='average') - .5) / len(matrix)
+    return ranked
+
+
+def rank_oof_matrix(matrix, cv):
+    ranked = np.full(matrix.shape, np.nan, dtype=float)
+    for _, iv in cv:
+        ranked[iv] = rank_columns(matrix[iv])
+    return ranked
+
+
+def blend_values(matrix, weights, mode):
+    if mode not in ('probability', 'rank'):
+        raise ValueError(f'Unknown blend mode: {mode}')
+    values = rank_columns(matrix) if mode == 'rank' else matrix
+    return values @ np.asarray(weights)
+
+
+def fold_auc_scores(y, prediction, cv):
+    return [float(roc_auc_score(y[iv], prediction[iv])) for _, iv in cv]
+
+
+def rank_blend_allowed(probability_auc, rank_auc, probability_folds, rank_folds):
+    wins = sum(rank > probability + 1e-6
+               for probability, rank in zip(probability_folds, rank_folds))
+    return rank_auc > probability_auc + 1e-6 and wins >= 3, wins
+
+
 def freeze(args):
     run, cfg, tr, te, sub, id_col, cols, y, (dev, sealed, cv, outer) = context(args)
     if (run / 'frozen.json').exists():
@@ -493,15 +596,19 @@ def freeze(args):
     manifest_path = run / 'promoted.json'
     manifest = p.read_json(manifest_path) if manifest_path.exists() else {'lanes': {}}
     # Only the latest explicit promotion set can be selected.
-    for lane, limit in [('lgb', 3), ('xgb', 2)]:
+    for lane, limit in [('lgb', 3), ('xgb', 2), ('cat', 1)]:
         if not any((run / 'candidates').glob(f'{lane}_*.json')):
             continue
-        study = optuna.load_study(study_name=lane, storage=f"sqlite:///{(run / 'optuna.db').resolve().as_posix()}")
-        complete = {f'{lane}_{trial.number}' for trial in study.trials
-                    if trial.state == optuna.trial.TrialState.COMPLETE}
         if lane not in manifest.get('lanes', {}):
             raise ValueError(f'Missing promoted.json entry for {lane}; rerun search before freeze.')
         names = manifest['lanes'][lane]
+        if lane == 'cat':
+            complete = set(names)
+        else:
+            study = optuna.load_study(study_name=lane,
+                storage=f"sqlite:///{(run / 'optuna.db').resolve().as_posix()}")
+            complete = {f'{lane}_{trial.number}' for trial in study.trials
+                        if trial.state == optuna.trial.TrialState.COMPLETE}
         invalid = [name for name in names if name not in complete
                    or not (run / 'candidates' / f'{name}.json').exists()
                    or p.read_json(run / 'candidates' / f'{name}.json').get('stage') != 'full']
@@ -523,23 +630,37 @@ def freeze(args):
                 selected.append((record, oof))
                 kept += 1
     matrix = np.column_stack([oof for _, oof in selected])
-    best = dict(auc=float(roc_auc_score(y[dev], matrix[dev, 0])),
-                weights=next(weight_grid(len(selected))))
-    comparisons = []
-    for weights in weight_grid(len(selected)):
-        score = float(roc_auc_score(y[dev], matrix[dev] @ weights))
-        comparisons.append(dict(weights=weights.tolist(), auc=score))
-        if score > best['auc'] + 1e-6:
-            best = dict(auc=score, weights=weights.copy())
-    p.write_json(run / 'blend_comparison.json', comparisons)
+    rank_matrix = rank_oof_matrix(matrix, cv)
+    best = {}
+    for mode, values in [('probability', matrix), ('rank', rank_matrix)]:
+        winner = dict(auc=float(roc_auc_score(y[dev], values[dev, 0])),
+                      weights=next(weight_grid(len(selected))))
+        for weights in weight_grid(len(selected)):
+            score = float(roc_auc_score(y[dev], values[dev] @ weights))
+            if score > winner['auc'] + 1e-6:
+                winner = dict(auc=score, weights=weights.copy())
+        winner['fold_auc'] = fold_auc_scores(y, values @ winner['weights'], cv)
+        best[mode] = winner
+    allowed, rank_wins = rank_blend_allowed(best['probability']['auc'], best['rank']['auc'],
+        best['probability']['fold_auc'], best['rank']['fold_auc'])
+    mode = 'rank' if allowed else 'probability'
+    winner = best[mode]
+    p.write_json(run / 'blend_comparison.json', dict(
+        candidates=[c['name'] for c, _ in selected],
+        probability=dict(auc=best['probability']['auc'], weights=best['probability']['weights'].tolist(),
+                         fold_auc=best['probability']['fold_auc']),
+        rank=dict(auc=best['rank']['auc'], weights=best['rank']['weights'].tolist(),
+                  fold_auc=best['rank']['fold_auc']),
+        rank_fold_wins=rank_wins, rank_required_fold_wins=3, chosen_mode=mode))
     p.write_json(run / 'candidate_correlation.json', dict(names=[c['name'] for c, _ in selected],
         pearson=np.nan_to_num(np.atleast_2d(np.corrcoef(matrix[dev], rowvar=False)), nan=1).tolist()))
-    chosen = [(c, float(w)) for (c, _), w in zip(selected, best['weights']) if w > 0]
+    chosen = [(c, float(w)) for (c, _), w in zip(selected, winner['weights']) if w > 0]
     p.write_json(run / 'frozen.json', dict(candidates=[c for c, _ in chosen], weights=[w for _, w in chosen],
-        mode='probability', development_selection_auc=best['auc'], baseline=baseline[0],
+        mode=mode, development_selection_auc=winner['auc'], development_fold_auc=winner['fold_auc'],
+        rank_fold_wins=rank_wins, baseline=baseline[0],
         config_sha256=p.digest(run / 'config.json'),
         note='Weights selected only on development OOF. Selection-biased; no Public LB tuning.'))
-    print(f'Frozen probability blend; dev AUC={best["auc"]:.7f}; weights={[w for _, w in chosen]}', flush=True)
+    print(f'Frozen {mode} blend; dev AUC={winner["auc"]:.7f}; weights={[w for _, w in chosen]}', flush=True)
 
 
 def frozen_config(run):
@@ -560,7 +681,7 @@ def audit(args):
         return
     p.write_json(run / 'SEALED_OPENED.json', dict(frozen_sha256=p.digest(run / 'frozen.json')))
     values = [folds(args, cfg, c, 'final', [4])[4][0][:len(sealed)] for c in frozen['candidates']]
-    pred = np.column_stack(values) @ np.array(frozen['weights'])
+    pred = blend_values(np.column_stack(values), frozen['weights'], frozen['mode'])
     baseline = folds(args, cfg, frozen['baseline'], 'final', [4])[4][0][:len(sealed)]
     p.write_json(run / 'sealed_report.json', dict(sealed_auc=float(roc_auc_score(y[sealed], pred)),
         baseline_auc=float(roc_auc_score(y[sealed], baseline)), public_lb=None,
@@ -579,8 +700,8 @@ def finalize(args):
         iv = np.flatnonzero(outer == fold)
         vm = np.column_stack([r[fold][0][:len(iv)] for r in predictions])
         tm = np.column_stack([r[fold][0][len(iv):] for r in predictions])
-        oof[iv] = vm @ np.array(frozen['weights'])
-        test_folds.append(tm @ np.array(frozen['weights']))
+        oof[iv] = blend_values(vm, frozen['weights'], frozen['mode'])
+        test_folds.append(blend_values(tm, frozen['weights'], frozen['mode']))
     test = np.mean(test_folds, axis=0)
     sub[p.TARGET] = sub[id_col].map(pd.Series(test, index=te[id_col]))
     if sub[p.TARGET].isna().any() or not sub[p.TARGET].between(0, 1).all():
@@ -605,11 +726,12 @@ def main():
     parser.add_argument('command', choices=['search', 'freeze', 'audit', 'finalize', 'worker', 'worker-loop'])
     parser.add_argument('--job')
     parser.add_argument('--data', default='/kaggle/input/competitions/playground-series-s6e9')
-    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_4')
+    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_5')
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--threads', type=int, default=4, help='Total CPU budget across concurrent folds')
     parser.add_argument('--gpu-ids', nargs='+', default=None, help='Two physical T4 IDs/UUIDs; default auto-detect')
     parser.add_argument('--domain-compare', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--cat-compare', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--screen-folds', type=int, default=2)
     parser.add_argument('--promote-trials', type=int, default=3)
     parser.add_argument('--max-rounds', type=int, default=3500)

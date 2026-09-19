@@ -364,8 +364,13 @@ def fit_model(family, params, x, y, valid, seed, cfg, rounds=None):
     else:
         from catboost import CatBoostClassifier
         cats = list(x.select_dtypes(include=["object", "string"]))
+        cat_device = cfg.get("cat_device", "cpu")
+        if cat_device not in ("cpu", "cuda"):
+            raise ValueError("CatBoost device must be cpu or cuda")
+        backend = (dict(task_type="GPU", devices=str(cfg.get("cat_gpu_id", 0)))
+                   if cat_device == "cuda" else dict(task_type="CPU"))
         model = CatBoostClassifier(**params, iterations=n, loss_function="Logloss", eval_metric="AUC",
-            thread_count=cfg["threads"], random_seed=seed, allow_writing_files=False, verbose=False)
+            thread_count=cfg["threads"], random_seed=seed, allow_writing_files=False, verbose=False, **backend)
         model.fit(x, y, cat_features=cats, eval_set=valid, use_best_model=bool(valid),
             early_stopping_rounds=stop if valid else None, verbose=False)
         best = model.get_best_iteration() + 1 if valid else n

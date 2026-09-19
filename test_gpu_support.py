@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import lightgbm as lgb
+import catboost
 import prototype as p
 import gpu_setup as g
 
@@ -27,6 +28,22 @@ def test_cuda_configuration_keeps_bins_and_excludes_cpu_only_flags(monkeypatch):
     assert captured['device_type'] == 'cuda' and captured['gpu_device_id'] == 1
     assert captured['max_bin'] == 255 and captured['num_gpu'] == 1
     assert 'deterministic' not in captured and 'force_col_wise' not in captured
+
+
+def test_catboost_uses_the_isolated_cuda_device(monkeypatch):
+    captured = {}
+    class Model:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+        def fit(self, *args, **kwargs):
+            return self
+        def get_best_iteration(self):
+            return 2
+    monkeypatch.setattr(catboost, 'CatBoostClassifier', Model)
+    x = pd.DataFrame({'a': np.arange(20)})
+    cfg = dict(max_rounds=4, early_stopping=2, threads=2, cat_device='cuda', cat_gpu_id=0)
+    p.fit_model('cat', p.defaults('cat'), x, np.tile([0, 1], 10), None, 2026, cfg, 4)
+    assert captured['task_type'] == 'GPU' and captured['devices'] == '0'
 
 
 def test_large_bins_use_cpu_without_changing_model_parameters():
@@ -111,6 +128,7 @@ def test_notebook_embeds_sources_and_passes_gpu_options():
     search = next(c for c in code if c.startswith("execute('search'"))
     runner = next(c for c in code if c.startswith('def execute('))
     assert "'--gpu-ids'" in runner and "'--parallel-folds'" not in runner
+    assert "'--cat-compare'" in runner and 'CAT_COMPARE = True' in '\n'.join(code)
     assert "execute('search')" in search
     assert 'pip install' not in '\n'.join(code)
     assert '_gpu_setup.require_t4_pair' in embedded
