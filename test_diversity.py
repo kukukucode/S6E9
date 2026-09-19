@@ -139,34 +139,57 @@ def test_two_gpu_folds_are_isolated_and_complete_predictions_are_reused(tmp_path
     frame = pd.DataFrame({d.p.TARGET: y})
     monkeypatch.setattr(d.p, 'load_data', lambda _: (frame, None, None, None, None))
     _, _, cv, _ = d.p.split_plan(y)
-    calls, active = [], []
+    calls, processes = [], []
+    def complete(job_path, env):
+        job = d.p.read_json(job_path)
+        calls.append((job['folds'], env['CUDA_VISIBLE_DEVICES'], job['threads']))
+        for fold in job['folds']:
+            output = Path(job['outputs'][str(fold)])
+            np.save(output, np.full(len(cv[fold][1]), .5), allow_pickle=False)
+            d.p.write_json(output.with_suffix('.json'), dict(sha256=d.p.digest(output), rounds=3))
+        if 'status' in job:
+            d.p.write_json(job['status'], {'ok': True})
     class Process:
-        def __init__(self, command, stdout, stderr, env):
+        def __init__(self, command, stdout, stderr, env, stdin=None, text=None, bufsize=None):
             self.code = None
-            active.append(self)
-            assert len([p for p in active if p.code is None]) <= 2
-            job = d.p.read_json(command[-1])
-            calls.append((job['folds'], env['CUDA_VISIBLE_DEVICES'], job['threads']))
-            for fold in job['folds']:
-                output = Path(job['outputs'][str(fold)])
-                np.save(output, np.full(len(cv[fold][1]), .5), allow_pickle=False)
-                d.p.write_json(output.with_suffix('.json'), dict(sha256=d.p.digest(output), rounds=3))
-        def wait(self):
+            processes.append(self)
+            if 'worker-loop' in command:
+                owner = self
+                class Input:
+                    def write(self, line):
+                        complete(line.strip(), env)
+                    def flush(self):
+                        pass
+                    def close(self):
+                        owner.code = 0
+                self.stdin = Input()
+            else:
+                self.stdin = None
+                complete(command[-1], env)
+        def wait(self, timeout=None):
             self.code = 0
             return 0
         def poll(self):
             return self.code
         def terminate(self):
             self.code = -15
+    d.shutdown_gpu_workers()
     monkeypatch.setattr(d.subprocess, 'Popen', Process)
     args = Namespace(run=str(tmp_path), data='unused', gpu_ids=['GPU-a', 'GPU-b'], threads=4, seed=2026,
         _data=(None, None, None, None, None, y, d.p.split_plan(y)))
     candidate = dict(d.anchor(), device='cuda', params=dict(d.anchor()['params'], max_bin=255))
-    first = d.folds(args, {}, candidate, 'dev', [0, 1, 2, 3])
-    second = d.folds(args, {}, candidate, 'dev', [0, 1, 2, 3])
-    assert calls == [([0, 2], 'GPU-a', 2), ([1, 3], 'GPU-b', 2)]
-    for fold in range(4):
-        np.testing.assert_array_equal(first[fold][0], second[fold][0])
+    try:
+        first = d.folds(args, {}, candidate, 'dev', [0, 1, 2, 3])
+        second = d.folds(args, {}, candidate, 'dev', [0, 1, 2, 3])
+        other = dict(candidate, name='other', params=dict(candidate['params'], max_bin=127))
+        d.folds(args, {}, other, 'dev', [0, 1, 2, 3])
+        assert calls == [([0, 2], 'GPU-a', 2), ([1, 3], 'GPU-b', 2),
+                         ([0, 2], 'GPU-a', 2), ([1, 3], 'GPU-b', 2)]
+        assert len(processes) == 2
+        for fold in range(4):
+            np.testing.assert_array_equal(first[fold][0], second[fold][0])
+    finally:
+        d.shutdown_gpu_workers()
     calls.clear()
     cpu = d.anchor()
     d.folds(args, {}, cpu, 'dev', [0, 1, 2, 3])
@@ -219,6 +242,32 @@ def test_search_screens_every_trial_and_promotes_only_top_three(tmp_path, monkey
     assert {name for name, folds, stage in calls if stage == 'full' and name.startswith('lgb_')} == {
         'lgb_1', 'lgb_2', 'lgb_3'}
     assert all(folds == [0, 1] for _, folds, stage in calls if stage == 'screen')
+    assert d.p.read_json(tmp_path / 'promoted.json')['lanes']['lgb'] == ['lgb_3', 'lgb_2', 'lgb_1']
+
+
+def test_freeze_ignores_old_full_candidates_outside_promotion_manifest(tmp_path, monkeypatch):
+    y = np.tile([0, 1], 100)
+    split = d.p.split_plan(y)
+    dev, _, _, _ = split
+    folder = tmp_path / 'candidates'
+    folder.mkdir()
+    for name in ('lgb_0', 'lgb_1'):
+        d.p.write_json(folder / f'{name}.json', {'stage': 'full'})
+    d.p.write_json(tmp_path / 'promoted.json', {'lanes': {'lgb': ['lgb_1']}})
+    trials = [SimpleNamespace(number=i, state=d.optuna.trial.TrialState.COMPLETE) for i in range(2)]
+    monkeypatch.setattr(d.optuna, 'load_study', lambda **kwargs: SimpleNamespace(trials=trials))
+    monkeypatch.setattr(d, 'context', lambda args: (tmp_path, {}, None, None, None, None, None, y, split))
+    loaded = []
+    def fake_load(run, name, labels, development, sealed):
+        loaded.append(name)
+        prediction = np.random.default_rng(len(loaded)).uniform(.1, .9, len(labels))
+        prediction[sealed] = np.nan
+        return ({'name': name, 'dev_auc': float(d.roc_auc_score(labels[development], prediction[development]))},
+                prediction)
+    monkeypatch.setattr(d, 'load_candidate', fake_load)
+    monkeypatch.setattr(d.p, 'digest', lambda path: 'fixture')
+    d.freeze(Namespace(domain_compare=False, auc_window=1, max_corr=1))
+    assert loaded == ['main', 'lgb_1']
 
 
 def test_domain_can_be_primary_but_original_anchor_remains_audit_baseline(tmp_path, monkeypatch):

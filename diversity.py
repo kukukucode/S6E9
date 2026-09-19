@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import traceback
 
 import joblib
 import numpy as np
@@ -108,11 +109,19 @@ def checked_prediction(path):
     return pred, meta
 
 
-def worker(path):
+def worker(path, data_state=None):
     """Load binary data once and process all folds assigned to this device."""
     job = p.read_json(path)
     cfg, candidate = job['config'], job['candidate']
-    tr, te, _, cols, y, (_, _, cv, outer) = joblib.load(cfg['_data_cache'])
+    if data_state is None:
+        data = joblib.load(cfg['_data_cache'])
+    else:
+        cache_path = str(Path(cfg['_data_cache']).resolve())
+        if data_state.get('path') != cache_path:
+            data_state.clear()
+            data_state.update(path=cache_path, value=joblib.load(cache_path))
+        data = data_state['value']
+    tr, te, _, cols, y, (_, _, cv, outer) = data
     phase = job['phase']
     for fold in job['folds']:
         started = time.perf_counter()
@@ -165,6 +174,117 @@ def worker(path):
             feature_cache_bytes=cache.stat().st_size))
 
 
+def worker_loop():
+    """Keep one interpreter and binary data cache alive for one isolated GPU."""
+    data_state = {}
+    for line in sys.stdin:
+        job_path = line.strip()
+        if not job_path:
+            continue
+        status = None
+        try:
+            job = p.read_json(job_path)
+            status = Path(job['status'])
+            worker(job_path, data_state)
+            p.write_json(status, {'ok': True})
+        except BaseException:
+            error = traceback.format_exc()
+            print(error, file=sys.stderr, flush=True)
+            if status is not None:
+                p.write_json(status, {'ok': False, 'error': error})
+
+
+class GpuWorkerPool:
+    """One persistent child per T4; jobs remain isolated by CUDA visibility."""
+    def __init__(self):
+        self.processes = {}
+
+    def _start(self, slot, selector, threads, log_path):
+        env = dict(os.environ, OMP_NUM_THREADS=str(threads), OPENBLAS_NUM_THREADS=str(threads),
+            PYTHONFAULTHANDLER='1', PYTHONUNBUFFERED='1', CUDA_VISIBLE_DEVICES=str(selector))
+        log = log_path.open('a', encoding='utf8')
+        try:
+            proc = subprocess.Popen([sys.executable, '-X', 'faulthandler', '-u', str(Path(__file__).resolve()),
+                'worker-loop'], stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+                env=env, text=True, bufsize=1)
+        except BaseException:
+            log.close()
+            raise
+        self.processes[slot] = dict(selector=str(selector), threads=threads, proc=proc,
+            log=log, log_path=log_path)
+        return self.processes[slot]
+
+    def submit(self, slot, selector, threads, job_path, status_path, log_path):
+        item = self.processes.get(slot)
+        if item is not None and (item['selector'] != str(selector) or item['threads'] != threads
+                                 or item['proc'].poll() is not None):
+            self._stop(item)
+            self.processes.pop(slot, None)
+            item = None
+        if item is None:
+            item = self._start(slot, selector, threads, log_path)
+        status_path.unlink(missing_ok=True)
+        item['proc'].stdin.write(str(Path(job_path).resolve()) + '\n')
+        item['proc'].stdin.flush()
+        return dict(item, status_path=status_path)
+
+    @staticmethod
+    def _tail(path):
+        return path.read_text(encoding='utf8', errors='replace')[-5000:] if path.exists() else ''
+
+    def wait(self, tasks):
+        pending = list(tasks)
+        while pending:
+            for task in pending[:]:
+                if task['status_path'].exists():
+                    status = p.read_json(task['status_path'])
+                    if not status.get('ok'):
+                        raise RuntimeError(f'GPU worker failed. Log: {task["log_path"]}\n'
+                            f'{status.get("error", self._tail(task["log_path"]))}')
+                    pending.remove(task)
+                elif task['proc'].poll() is not None:
+                    raise RuntimeError(f'GPU worker exited ({task["proc"].poll()}). Log: '
+                        f'{task["log_path"]}\n{self._tail(task["log_path"])}')
+            if pending:
+                time.sleep(.05)
+
+    @staticmethod
+    def _stop(item):
+        proc = item['proc']
+        try:
+            if proc.poll() is None:
+                proc.stdin.close()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+                    proc.wait()
+        finally:
+            item['log'].close()
+
+    def shutdown(self):
+        for item in list(self.processes.values()):
+            self._stop(item)
+        self.processes.clear()
+
+
+_GPU_POOL = None
+
+
+def gpu_pool():
+    global _GPU_POOL
+    if _GPU_POOL is None:
+        _GPU_POOL = GpuWorkerPool()
+    return _GPU_POOL
+
+
+def shutdown_gpu_workers():
+    global _GPU_POOL
+    if _GPU_POOL is not None:
+        _GPU_POOL.shutdown()
+        _GPU_POOL = None
+
+
 def folds(args, cfg, candidate, phase, requested):
     run = Path(args.run)
     cache = run / 'cache' / 'predictions'
@@ -189,7 +309,7 @@ def folds(args, cfg, candidate, phase, requested):
             pending.append(fold)
     groups = ([pending] if candidate['device'] == 'cpu' else
               [[fold for fold in pending if fold % 2 == slot] for slot in range(2)])
-    processes = []
+    processes, tasks = [], []
     try:
         for slot, assigned in enumerate(groups):
             if not assigned:
@@ -197,21 +317,31 @@ def folds(args, cfg, candidate, phase, requested):
             selector = '' if candidate['device'] == 'cpu' else str(args.gpu_ids[slot])
             tag = key(dict(candidate=spec, phase=phase, folds=assigned, selector=selector, threads=threads))
             job = jobs / f'{tag}.json'
+            status_path = jobs / f'{tag}.status.json'
             p.write_json(job, dict(config=cfg, candidate=candidate, phase=phase, folds=assigned,
-                threads=threads, run=str(run.resolve()), outputs={str(f): str(outputs[f].resolve()) for f in assigned}))
+                threads=threads, run=str(run.resolve()), status=str(status_path.resolve()),
+                outputs={str(f): str(outputs[f].resolve()) for f in assigned}))
             env = dict(os.environ, OMP_NUM_THREADS=str(threads), OPENBLAS_NUM_THREADS=str(threads),
                 PYTHONFAULTHANDLER='1', PYTHONUNBUFFERED='1', CUDA_VISIBLE_DEVICES=selector)
-            log_path = jobs / f'{tag}.log'
+            log_path = jobs / (f'gpu_worker_{slot}.log' if candidate['device'] == 'cuda' else f'{tag}.log')
             device_label = 'CPU' if candidate['device'] == 'cpu' else f'GPU {selector}'
             print(f'Starting {candidate["name"]}/{phase}/folds {assigned} on {device_label}; log={log_path}', flush=True)
-            log = log_path.open('w', encoding='utf8')
-            try:
-                proc = subprocess.Popen([sys.executable, '-X', 'faulthandler', '-u', str(Path(__file__).resolve()),
-                    'worker', '--job', str(job.resolve())], stdout=log, stderr=subprocess.STDOUT, env=env)
-            except BaseException:
-                log.close()
-                raise
-            processes.append((assigned, proc, log, log_path))
+            if candidate['device'] == 'cuda':
+                tasks.append((assigned, gpu_pool().submit(slot, selector, threads, job, status_path, log_path)))
+            else:
+                log = log_path.open('w', encoding='utf8')
+                try:
+                    proc = subprocess.Popen([sys.executable, '-X', 'faulthandler', '-u', str(Path(__file__).resolve()),
+                        'worker', '--job', str(job.resolve())], stdout=log, stderr=subprocess.STDOUT, env=env)
+                except BaseException:
+                    log.close()
+                    raise
+                processes.append((assigned, proc, log, log_path))
+        if tasks:
+            gpu_pool().wait([task for _, task in tasks])
+            for assigned, _ in tasks:
+                for fold in assigned:
+                    results[fold] = checked_prediction(outputs[fold])
         for assigned, proc, log, log_path in processes:
             code = proc.wait()
             log.close()
@@ -301,7 +431,8 @@ def search(args):
         complete = sorted((trial for trial in study.trials
             if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None),
             key=lambda trial: trial.value, reverse=True)
-        for trial in complete[:min(args.promote_trials, len(complete))]:
+        promoted = complete[:min(args.promote_trials, len(complete))]
+        for trial in promoted:
             path = run / 'candidates' / f'{lane}_{trial.number}.json'
             record = p.read_json(path)
             if record.get('stage') == 'full':
@@ -310,6 +441,11 @@ def search(args):
                          for name in ('name', 'lane', 'family', 'variant', 'params', 'device')}
             print(f'Promoting {candidate["name"]} to full 4-fold CV', flush=True)
             evaluate(args, cfg, candidate, requested=list(range(4)), stage='full')
+        manifest_path = run / 'promoted.json'
+        manifest = p.read_json(manifest_path) if manifest_path.exists() else {
+            'screen_folds': args.screen_folds, 'promote_trials': args.promote_trials, 'lanes': {}}
+        manifest['lanes'][lane] = [f'{lane}_{trial.number}' for trial in promoted]
+        p.write_json(manifest_path, manifest)
     print('Search complete. No holdout labels used.', flush=True)
 
 
@@ -354,16 +490,23 @@ def freeze(args):
     if args.domain_compare:
         selected.append(load_candidate(run, 'domain', y, dev, sealed))
         selected.sort(key=lambda pair: pair[0]['dev_auc'], reverse=True)
-    # Only COMPLETE study trials qualify; never include interrupted or pruned artifacts.
+    manifest_path = run / 'promoted.json'
+    manifest = p.read_json(manifest_path) if manifest_path.exists() else {'lanes': {}}
+    # Only the latest explicit promotion set can be selected.
     for lane, limit in [('lgb', 3), ('xgb', 2)]:
         if not any((run / 'candidates').glob(f'{lane}_*.json')):
             continue
         study = optuna.load_study(study_name=lane, storage=f"sqlite:///{(run / 'optuna.db').resolve().as_posix()}")
         complete = {f'{lane}_{trial.number}' for trial in study.trials
                     if trial.state == optuna.trial.TrialState.COMPLETE}
-        names = [name for name in complete
-                 if (run / 'candidates' / f'{name}.json').exists()
-                 and p.read_json(run / 'candidates' / f'{name}.json').get('stage') == 'full']
+        if lane not in manifest.get('lanes', {}):
+            raise ValueError(f'Missing promoted.json entry for {lane}; rerun search before freeze.')
+        names = manifest['lanes'][lane]
+        invalid = [name for name in names if name not in complete
+                   or not (run / 'candidates' / f'{name}.json').exists()
+                   or p.read_json(run / 'candidates' / f'{name}.json').get('stage') != 'full']
+        if invalid:
+            raise ValueError(f'Invalid promoted candidates for {lane}: {invalid}')
         records = [load_candidate(run, name, y, dev, sealed) for name in names]
         if not records:
             continue
@@ -459,10 +602,10 @@ def finalize(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['search', 'freeze', 'audit', 'finalize', 'worker'])
+    parser.add_argument('command', choices=['search', 'freeze', 'audit', 'finalize', 'worker', 'worker-loop'])
     parser.add_argument('--job')
     parser.add_argument('--data', default='/kaggle/input/competitions/playground-series-s6e9')
-    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_3')
+    parser.add_argument('--run', default='/kaggle/working/s6e9_diversity_v5_4')
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--threads', type=int, default=4, help='Total CPU budget across concurrent folds')
     parser.add_argument('--gpu-ids', nargs='+', default=None, help='Two physical T4 IDs/UUIDs; default auto-detect')
@@ -481,6 +624,9 @@ def main():
             parser.error('worker requires --job')
         worker(args.job)
         return
+    if args.command == 'worker-loop':
+        worker_loop()
+        return
     if min(args.threads, args.max_rounds, args.early_stopping) < 1 or min(args.lgb_trials, args.xgb_trials) < 0:
         parser.error('Invalid budgets')
     if not 0 < args.max_corr <= 1 or args.auc_window < 0 or args.auc_window > 1:
@@ -488,7 +634,10 @@ def main():
     if not 1 <= args.screen_folds <= 4 or args.promote_trials < 1:
         parser.error('screen-folds must be 1..4 and promote-trials must be positive')
     args.gpu_ids = require_t4_pair(args.gpu_ids)
-    globals()[args.command](args)
+    try:
+        globals()[args.command](args)
+    finally:
+        shutdown_gpu_workers()
 
 
 if __name__ == '__main__':

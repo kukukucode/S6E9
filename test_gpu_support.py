@@ -73,10 +73,13 @@ def test_gpu_setup_builds_only_missing_cuda_support(monkeypatch, tmp_path):
         calls.append(command)
         if kwargs.get('capture_output') and len(calls) == 2:
             return SimpleNamespace(returncode=1, stdout='', stderr='CUDA Tree Learner was not enabled in this build.')
+        if 'wheel' in command:
+            folder = Path(command[command.index('--wheel-dir') + 1])
+            (folder / 'lightgbm-4.7.0-py3-none-linux_x86_64.whl').write_bytes(b'wheel')
         return SimpleNamespace(returncode=0, stdout='', stderr='')
     monkeypatch.setattr(g.subprocess, 'run', run)
     g.ensure_lightgbm_backend(tmp_path / 'prototype.py')
-    build = next(c for c in calls if 'pip' in c)
+    build = next(c for c in calls if 'wheel' in c)
     assert '--no-deps' in build and 'lightgbm==4.7.0' in build
     assert '--config-settings=cmake.define.USE_CUDA=ON' in build
     assert calls[-1][calls[-1].index('--lgb-device') + 1] == 'cuda'
@@ -147,6 +150,9 @@ def test_sigsegv_repair_is_bounded_and_preserves_crash_logs(monkeypatch, tmp_pat
             probes.append(command)
             code = 0 if repaired and len(probes) > 1 else -11
             return SimpleNamespace(returncode=code, stdout='CHECK_STAGE: fit begin\n', stderr='native stack trace\n')
+        if 'wheel' in command:
+            folder = Path(command[command.index('--wheel-dir') + 1])
+            (folder / 'lightgbm-4.7.0-py3-none-linux_x86_64.whl').write_bytes(b'wheel')
         return SimpleNamespace(returncode=0, stdout='', stderr='')
     monkeypatch.setattr(g.subprocess, 'run', run)
     script = tmp_path / 'prototype.py'
@@ -158,9 +164,34 @@ def test_sigsegv_repair_is_bounded_and_preserves_crash_logs(monkeypatch, tmp_pat
         # A repeated Run All must not spend another build on the same failed repair.
         with pytest.raises(RuntimeError, match='signal 11'):
             g.ensure_lightgbm_backend(script)
-    builds = [c for c in calls if 'pip' in c]
+    builds = [c for c in calls if 'wheel' in c]
     assert len(builds) == 1
     assert 'lightgbm==4.7.0' in builds[0]
     assert '--config-settings=cmake.define.CMAKE_CUDA_ARCHITECTURES=native' in builds[0]
     assert 'native stack trace' in (tmp_path / 'gpu_preflight_after.log').read_text()
     assert 'faulthandler' in probes[0]
+
+
+def test_valid_cached_cuda_wheel_skips_source_build(monkeypatch, tmp_path):
+    monkeypatch.setattr(g.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(g.shutil, 'which', lambda name, **kwargs: '/usr/bin/' + name)
+    folder = tmp_path / g.WHEEL_FOLDER
+    folder.mkdir()
+    wheel = folder / 'lightgbm-4.7.0-py3-none-linux_x86_64.whl'
+    wheel.write_bytes(b'cached wheel')
+    (folder / 'lightgbm_cuda_wheel.json').write_text(json.dumps(g._wheel_marker(wheel)), encoding='utf8')
+    calls, probes = [], 0
+    def run(command, **kwargs):
+        nonlocal probes
+        calls.append(command)
+        if kwargs.get('capture_output'):
+            probes += 1
+            if probes == 1:
+                return SimpleNamespace(returncode=1, stdout='', stderr='CUDA Tree Learner was not enabled in this build.')
+            return SimpleNamespace(returncode=0, stdout='backend check passed: cuda', stderr='')
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+    monkeypatch.setattr(g.subprocess, 'run', run)
+    g.ensure_lightgbm_backend(tmp_path / 'prototype.py')
+    installs = [c for c in calls if 'install' in c]
+    assert len(installs) == 1 and str(wheel) in installs[0]
+    assert not any('wheel' in c for c in calls)
