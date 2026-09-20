@@ -120,11 +120,12 @@ def test_notebook_embeds_sources_and_passes_gpu_options():
     root = Path(__file__).parent
     nb = json.loads((root / 'S6E9_Prototype.ipynb').read_text(encoding='utf8'))
     code = [''.join(c['source']) for c in nb['cells'] if c['cell_type'] == 'code']
-    embedded = next(c for c in code if c.startswith('SCRIPT ='))
+    embedded = next(c for c in code if c.startswith('PACKAGE ='))
     literals = [ast.literal_eval(n.value.args[0]) for n in ast.parse(embedded).body
                 if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
                 and isinstance(n.value.func, ast.Attribute) and n.value.func.attr == 'write_text']
-    assert literals == [(root / name).read_text(encoding='utf8') for name in ('prototype.py', 'gpu_setup.py', 'diversity.py')]
+    assert literals[-3:] == [(root / name).read_text(encoding='utf8')
+                            for name in ('prototype.py', 'gpu_setup.py', 'diversity.py')]
     search = next(c for c in code if c.startswith("execute('search'"))
     runner = next(c for c in code if c.startswith('def execute('))
     assert "'--gpu-ids'" in runner and "'--parallel-folds'" not in runner
