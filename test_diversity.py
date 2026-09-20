@@ -7,6 +7,8 @@ import pandas as pd
 import pytest
 import diversity as d
 import gpu_setup as g
+import s6e9.freeze as freezing
+import s6e9.tuning as tuning
 
 
 def test_micro_blend_keeps_baseline_and_convex_probabilities():
@@ -35,7 +37,7 @@ def test_seed_ensemble_averages_cached_member_predictions(monkeypatch):
         seed = candidate.get('model_seed', cfg['seed'])
         calls.append(seed)
         return {fold: (np.full(3, seed / 10000), {'rounds': seed % 10 + 1}) for fold in requested}
-    monkeypatch.setattr(d, 'single_seed_folds', fake)
+    monkeypatch.setattr(tuning, 'single_seed_folds', fake)
     candidate = dict(d.domain_anchor(), model_seeds=[2026, 42, 3407])
     result = d.folds(None, {'seed': 2026}, candidate, 'dev', [0])
     assert calls == [2026, 42, 3407]
@@ -229,6 +231,7 @@ def test_two_gpu_folds_are_isolated_and_complete_predictions_are_reused(tmp_path
     class Process:
         def __init__(self, command, stdout, stderr, env, stdin=None, text=None, bufsize=None):
             self.code = None
+            self.command = command
             processes.append(self)
             if 'worker-loop' in command:
                 owner = self
@@ -263,6 +266,7 @@ def test_two_gpu_folds_are_isolated_and_complete_predictions_are_reused(tmp_path
         assert calls == [([0, 2], 'GPU-a', 2), ([1, 3], 'GPU-b', 2),
                          ([0, 2], 'GPU-a', 2), ([1, 3], 'GPU-b', 2)]
         assert len(processes) == 2
+        assert all(Path(process.command[4]).name == 'diversity.py' for process in processes)
         for fold in range(4):
             np.testing.assert_array_equal(first[fold][0], second[fold][0])
     finally:
@@ -282,7 +286,7 @@ def test_screen_evaluation_reuses_predictions_when_promoted(tmp_path, monkeypatc
     def fake_folds(args, cfg, candidate, phase, requested):
         calls.append(list(requested))
         return {fold: (.1 + .8 * y[cv[fold][1]], {'rounds': 10 + fold}) for fold in requested}
-    monkeypatch.setattr(d, 'folds', fake_folds)
+    monkeypatch.setattr(tuning, 'folds', fake_folds)
     candidate = d.anchor()
     assert d.evaluate(args, {}, candidate, [0, 1], 'screen') == 1
     screen = d.p.read_json(tmp_path / 'candidates' / 'main.json')
@@ -300,7 +304,7 @@ def test_screen_evaluation_reuses_predictions_when_promoted(tmp_path, monkeypatc
 def test_search_screens_every_trial_and_promotes_only_top_three(tmp_path, monkeypatch):
     args = Namespace(run=str(tmp_path), seed=2026, lgb_trials=4, xgb_trials=0,
         screen_folds=2, promote_trials=3, domain_compare=False, cat_compare=False)
-    monkeypatch.setattr(d, 'context', lambda args: (tmp_path, {}))
+    monkeypatch.setattr(tuning, 'context', lambda args: (tmp_path, {}))
     calls = []
     def fake_evaluate(args, cfg, candidate, requested=None, stage='full'):
         requested = [0, 1, 2, 3] if requested is None else requested
@@ -315,7 +319,7 @@ def test_search_screens_every_trial_and_promotes_only_top_three(tmp_path, monkey
             full_fold_auc={str(i): score for i in range(4)} if stage == 'full' else None,
             dev_auc=score if stage == 'full' else None))
         return score
-    monkeypatch.setattr(d, 'evaluate', fake_evaluate)
+    monkeypatch.setattr(tuning, 'evaluate', fake_evaluate)
     d.search(args)
     assert [name for name, folds, stage in calls if stage == 'screen'] == [f'lgb_{i}' for i in range(4)]
     assert {name for name, folds, stage in calls if stage == 'full' and name.startswith('lgb_')} == {
@@ -329,7 +333,7 @@ def test_search_screens_every_trial_and_promotes_only_top_three(tmp_path, monkey
 def test_search_evaluates_one_fixed_catboost_candidate(tmp_path, monkeypatch):
     args = Namespace(run=str(tmp_path), seed=2026, lgb_trials=0, xgb_trials=0,
         screen_folds=2, promote_trials=3, domain_compare=False, cat_compare=True)
-    monkeypatch.setattr(d, 'context', lambda args: (tmp_path, {}))
+    monkeypatch.setattr(tuning, 'context', lambda args: (tmp_path, {}))
     calls = []
     def fake_evaluate(args, cfg, candidate, requested=None, stage='full'):
         requested = [0, 1, 2, 3] if requested is None else requested
@@ -344,7 +348,7 @@ def test_search_evaluates_one_fixed_catboost_candidate(tmp_path, monkeypatch):
             full_fold_auc={str(i): score for i in range(4)} if stage == 'full' else None,
             dev_auc=score if stage == 'full' else None))
         return score
-    monkeypatch.setattr(d, 'evaluate', fake_evaluate)
+    monkeypatch.setattr(tuning, 'evaluate', fake_evaluate)
     d.search(args)
     assert [call for call in calls if call[0] == 'cat_fixed'] == [
         ('cat_fixed', [0, 1], 'screen', 'cuda'),
@@ -363,7 +367,7 @@ def test_freeze_ignores_old_full_candidates_outside_promotion_manifest(tmp_path,
     d.p.write_json(tmp_path / 'promoted.json', {'lanes': {'lgb': ['lgb_1']}})
     trials = [SimpleNamespace(number=i, state=d.optuna.trial.TrialState.COMPLETE) for i in range(2)]
     monkeypatch.setattr(d.optuna, 'load_study', lambda **kwargs: SimpleNamespace(trials=trials))
-    monkeypatch.setattr(d, 'context', lambda args: (tmp_path, {}, None, None, None, None, None, y, split))
+    monkeypatch.setattr(freezing, 'context', lambda args: (tmp_path, {}, None, None, None, None, None, y, split))
     loaded = []
     def fake_load(run, name, labels, development, sealed):
         loaded.append(name)
@@ -371,7 +375,7 @@ def test_freeze_ignores_old_full_candidates_outside_promotion_manifest(tmp_path,
         prediction[sealed] = np.nan
         return ({'name': name, 'dev_auc': float(d.roc_auc_score(labels[development], prediction[development]))},
                 prediction)
-    monkeypatch.setattr(d, 'load_candidate', fake_load)
+    monkeypatch.setattr(freezing, 'load_candidate', fake_load)
     monkeypatch.setattr(d.p, 'digest', lambda path: 'fixture')
     d.freeze(Namespace(domain_compare=False, auc_window=1, max_corr=1))
     assert loaded == ['main', 'lgb_1']
@@ -394,7 +398,7 @@ def test_domain_can_be_primary_but_original_anchor_remains_audit_baseline(tmp_pa
             dev_auc=float(d.roc_auc_score(y[dev], oof[dev])), rounds=[4] * 4, fixed_rounds=4,
             oof_sha256=d.p.digest(folder / f'{name}.npy'))
         d.p.write_json(folder / f'{name}.json', record)
-    monkeypatch.setattr(d, 'context', lambda args: (tmp_path, {}, None, None, None, None, None, y, split))
+    monkeypatch.setattr(freezing, 'context', lambda args: (tmp_path, {}, None, None, None, None, None, y, split))
     d.freeze(Namespace(domain_compare=True, auc_window=.0004, max_corr=.999))
     frozen = d.p.read_json(tmp_path / 'frozen.json')
     assert frozen['candidates'][0]['name'] == 'domain' and frozen['weights'] == [1.0]
