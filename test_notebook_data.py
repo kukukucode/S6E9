@@ -8,6 +8,33 @@ import tempfile
 import unittest
 
 
+class NotebookPackageTests(unittest.TestCase):
+    def test_embedded_package_matches_repository_sources(self):
+        root = Path(__file__).parent
+        notebook = json.loads((root / 'S6E9_Prototype.ipynb').read_text(encoding='utf-8'))
+        source = next(''.join(cell['source']) for cell in notebook['cells']
+                      if cell['cell_type'] == 'code' and "PACKAGE = Path('/kaggle/working/s6e9')" in ''.join(cell['source']))
+        assignments = {}
+        for node in ast.parse(source).body:
+            if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+                continue
+            function = node.value.func
+            if not isinstance(function, ast.Attribute) or function.attr != 'write_text':
+                continue
+            target = function.value
+            if isinstance(target, ast.Name):
+                assignments[target.id] = ast.literal_eval(node.value.args[0])
+            elif isinstance(target, ast.BinOp) and isinstance(target.op, ast.Div):
+                assignments['s6e9/' + ast.literal_eval(target.right)] = ast.literal_eval(node.value.args[0])
+        expected = {'SCRIPT': 'prototype.py', 'GPU_SETUP': 'gpu_setup.py',
+                    'DIVERSITY_SCRIPT': 'diversity.py'}
+        expected.update({f's6e9/{path.name}': str(path.relative_to(root)).replace('\\', '/')
+                         for path in (root / 's6e9').glob('*.py')})
+        self.assertEqual(set(assignments), set(expected))
+        for key, filename in expected.items():
+            self.assertEqual(assignments[key], (root / filename).read_text(encoding='utf-8'))
+
+
 class NotebookDataTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

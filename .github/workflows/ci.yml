@@ -28,6 +28,7 @@ jobs:
       - name: Compile Python sources
         run: |
           python -m compileall -q \
+            s6e9 \
             prototype.py \
             diversity.py \
             gpu_setup.py
