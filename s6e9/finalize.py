@@ -20,6 +20,8 @@ def finalize(args):
         candidates.append(tie['candidate'])
     predictions = {c['name']: folds(args, cfg, c, 'final', list(range(5))) for c in candidates}
     oof, test_folds, test_secondary_folds = np.empty(len(y)), [], []
+    variant_oof = {mode: np.empty(len(y)) for mode in ('probability', 'rank')}
+    variant_test_folds = {mode: [] for mode in variant_oof}
     oof_secondary = np.empty(len(y)) if tie is not None else None
     for fold in range(5):
         iv = np.flatnonzero(outer == fold)
@@ -27,6 +29,9 @@ def finalize(args):
         tm = np.column_stack([predictions[c['name']][fold][0][len(iv):] for c in frozen['candidates']])
         valid_blend = blend_values(vm, frozen['weights'], frozen['mode'])
         test_blend = blend_values(tm, frozen['weights'], frozen['mode'])
+        for mode in variant_oof:
+            variant_oof[mode][iv] = blend_values(vm, frozen['weights'], mode)
+            variant_test_folds[mode].append(blend_values(tm, frozen['weights'], mode))
         if tie is not None:
             secondary = predictions[tie['candidate']['name']][fold][0]
             oof_secondary[iv] = secondary[:len(iv)]
@@ -41,7 +46,22 @@ def finalize(args):
     if sub[p.TARGET].isna().any() or not sub[p.TARGET].between(0, 1).all():
         raise ValueError('Invalid submission probabilities or ID alignment')
     sub.to_csv(run / 'submission.csv', index=False)
-    result = pd.DataFrame({id_col: tr[id_col], p.TARGET: y, 'fold': outer, 'prediction': oof})
+    variant_reports = {}
+    for mode in variant_oof:
+        variant_test = np.mean(variant_test_folds[mode], axis=0)
+        variant_sub = sub.copy()
+        variant_sub[p.TARGET] = variant_sub[id_col].map(pd.Series(variant_test, index=te[id_col]))
+        if variant_sub[p.TARGET].isna().any() or not variant_sub[p.TARGET].between(0, 1).all():
+            raise ValueError(f'Invalid {mode} submission probabilities or ID alignment')
+        path = run / f'submission_{mode}.csv'
+        variant_sub.to_csv(path, index=False)
+        variant_reports[mode] = dict(
+            final_oof_auc=float(roc_auc_score(y, variant_oof[mode])),
+            submission_sha256=p.digest(path))
+    result = pd.DataFrame({id_col: tr[id_col], p.TARGET: y, 'fold': outer,
+                           'prediction': oof,
+                           'probability_prediction': variant_oof['probability'],
+                           'rank_prediction': variant_oof['rank']})
     for c in candidates:
         model_predictions = predictions[c['name']]
         raw_oof = np.empty(len(y))
@@ -52,6 +72,7 @@ def finalize(args):
     result.to_csv(run / 'final_oof.csv', index=False)
     p.write_json(run / 'final_report.json', dict(final_oof_auc=float(roc_auc_score(y, oof)),
         public_lb=None, submission_sha256=p.digest(run / 'submission.csv'),
+        cpu_submission_variants=variant_reports,
         note='OOF includes candidate/weight selection bias. Public LB remains unmeasured.'))
     write_runtime_profile(run)
-    print(f'Created {run / "submission.csv"}', flush=True)
+    print(f'Created {run / "submission.csv"} plus CPU-only probability/rank variants', flush=True)

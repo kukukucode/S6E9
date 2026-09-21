@@ -8,6 +8,7 @@ import pytest
 import diversity as d
 import gpu_setup as g
 import s6e9.freeze as freezing
+import s6e9.finalize as finalizing
 import s6e9.tuning as tuning
 
 
@@ -44,6 +45,54 @@ def test_fast_auc_and_combined_grid_match_reference_paths():
     assert wide[0] == pytest.approx(reference_wide[0], abs=1e-15)
     np.testing.assert_array_equal(narrow[1], reference_narrow[1])
     np.testing.assert_array_equal(wide[1], reference_wide[1])
+
+
+def test_one_percent_refinement_stays_convex_and_never_lowers_training_auc():
+    rng = np.random.default_rng(91)
+    y = np.tile([0, 1], 120)
+    values = rng.uniform(.05, .95, (len(y), 4))
+    rows = np.arange(len(y))
+    initial = np.array([.70, .05, .25, 0.])
+    initial_auc = d.binary_auc(y, values @ initial)
+    score, refined = d.refine_weights(y, values, rows, initial, .30)
+    assert score >= initial_auc
+    assert np.isclose(refined.sum(), 1) and (refined >= 0).all()
+    assert refined[0] >= .70 - 1e-12
+    np.testing.assert_allclose(refined * 100, np.round(refined * 100), atol=1e-10)
+
+
+def test_finalize_writes_probability_and_rank_submissions_without_extra_fits(tmp_path, monkeypatch):
+    y = np.tile([0, 1], 5)
+    outer = np.repeat(np.arange(5), 2)
+    train = pd.DataFrame({'id': np.arange(10)})
+    test = pd.DataFrame({'id': [10, 11, 12]})
+    sample = pd.DataFrame({'id': [12, 10, 11], d.p.TARGET: .5})
+    split = (np.arange(8), np.arange(8, 10), [], outer)
+    candidate = dict(name='main')
+    frozen = dict(candidates=[candidate], weights=[1.], mode='rank', tie_breaker=None)
+    d.p.write_json(tmp_path / 'sealed_report.json', {'sealed_auc': .5})
+    monkeypatch.setattr(finalizing, 'context', lambda args:
+        (tmp_path, {}, train, test, sample, 'id', [], y, split))
+    monkeypatch.setattr(finalizing, 'frozen_config', lambda run: frozen)
+    calls = []
+    def fake_folds(args, cfg, item, phase, requested):
+        calls.append((item['name'], phase, tuple(requested)))
+        result = {}
+        for fold in requested:
+            iv = np.flatnonzero(outer == fold)
+            valid = np.array([.2, .8]) if y[iv][0] == 0 else np.array([.8, .2])
+            result[fold] = (np.r_[valid, [.15 + .01 * fold, .55, .85 - .01 * fold]], {})
+        return result
+    monkeypatch.setattr(finalizing, 'folds', fake_folds)
+    monkeypatch.setattr(finalizing, 'write_runtime_profile', lambda run: None)
+    finalizing.finalize(Namespace(run=str(tmp_path)))
+    assert calls == [('main', 'final', (0, 1, 2, 3, 4))]
+    for name in ('submission.csv', 'submission_probability.csv', 'submission_rank.csv'):
+        frame = pd.read_csv(tmp_path / name)
+        assert frame.id.tolist() == [12, 10, 11]
+        assert frame[d.p.TARGET].between(0, 1).all()
+    report = d.p.read_json(tmp_path / 'final_report.json')
+    assert set(report['cpu_submission_variants']) == {'probability', 'rank'}
 
 
 def test_seed_ensemble_averages_cached_member_predictions(monkeypatch):

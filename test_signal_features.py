@@ -106,3 +106,25 @@ def test_domain_features_keep_original_signals_and_exclude_own_labels():
     transformed = fe.transform(unseen)
     assert list(transformed) == list(actual)
     assert np.isfinite(transformed[te_cols].to_numpy()).all()
+
+
+def test_domain_features_add_source_formula_and_interactions():
+    x = pd.DataFrame({
+        'Annual_Income_USD': [100000., 50000.],
+        'Environmental_Concern_Level': [4., 2.],
+        'Subsidy_Available': ['Yes', 'No'],
+        'Range_Anxiety_Level': ['Medium', 'High'],
+    })
+    actual = p.domain_features(x)
+    expected = {
+        'source_income_x_subsidy': [1., 0.],
+        'source_concern_x_subsidy': [4., 0.],
+        'source_income_x_concern': [4., 1.],
+        'source_anxiety_x_subsidy': [1., 0.],
+        'source_formula_score': [4.6, -1.2],
+    }
+    for column, values in expected.items():
+        np.testing.assert_allclose(actual[column], values)
+    keys, numeric = p.DomainSignalFeatures().keys(x)
+    for column in ('source_income_x_subsidy', 'source_income_x_concern', 'source_formula_score'):
+        assert column in numeric and column not in keys

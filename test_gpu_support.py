@@ -129,6 +129,13 @@ def test_notebook_embeds_sources_and_passes_gpu_options():
                 and isinstance(n.value.func, ast.Attribute) and n.value.func.attr == 'write_text']
     assert literals[-3:] == [(root / name).read_text(encoding='utf8')
                             for name in ('prototype.py', 'gpu_setup.py', 'diversity.py')]
+    package = {n.value.func.value.right.value: ast.literal_eval(n.value.args[0])
+               for n in ast.parse(embedded).body
+               if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+               and isinstance(n.value.func, ast.Attribute) and n.value.func.attr == 'write_text'
+               and isinstance(n.value.func.value, ast.BinOp)}
+    expected = {path.name: path.read_text(encoding='utf8') for path in (root / 's6e9').glob('*.py')}
+    assert package == expected
     search = next(c for c in code if c.startswith("execute('search'"))
     runner = next(c for c in code if c.startswith('def execute('))
     assert "'--gpu-ids'" in runner and "'--parallel-folds'" not in runner
