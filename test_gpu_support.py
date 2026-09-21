@@ -119,6 +119,9 @@ def test_gpu_setup_does_not_rebuild_or_fall_back_for_unrelated_failure(monkeypat
 def test_notebook_embeds_sources_and_passes_gpu_options():
     root = Path(__file__).parent
     nb = json.loads((root / 'S6E9_Prototype.ipynb').read_text(encoding='utf8'))
+    kaggle = nb['metadata']['kaggle']
+    assert kaggle['accelerator'] == 'nvidiaTeslaT4'
+    assert kaggle['isGpuEnabled'] and kaggle['isInternetEnabled']
     code = [''.join(c['source']) for c in nb['cells'] if c['cell_type'] == 'code']
     embedded = next(c for c in code if c.startswith('PACKAGE ='))
     literals = [ast.literal_eval(n.value.args[0]) for n in ast.parse(embedded).body
@@ -133,6 +136,7 @@ def test_notebook_embeds_sources_and_passes_gpu_options():
     assert "execute('search')" in search
     assert 'pip install' not in '\n'.join(code)
     assert '_gpu_setup.require_t4_pair' in embedded
+    assert 'REALMLP_COMPARE = False' in '\n'.join(code)
 
 
 def test_gpu_disabled_reports_accelerator_before_any_install(monkeypatch, tmp_path):
