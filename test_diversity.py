@@ -431,9 +431,9 @@ def test_search_screens_every_trial_and_promotes_only_top_three(tmp_path, monkey
     assert diagnostics['promoted_count'] == 3 and diagnostics['rank_correlation'] == pytest.approx(1)
 
 
-def test_search_evaluates_one_fixed_catboost_candidate(tmp_path, monkeypatch):
+def test_search_screens_four_catboost_candidates_and_promotes_control_and_best(tmp_path, monkeypatch):
     args = Namespace(run=str(tmp_path), seed=2026, lgb_trials=0, xgb_trials=0,
-        screen_folds=2, promote_trials=3, domain_compare=False, cat_compare=True)
+        cat_trials=4, screen_folds=2, promote_trials=3, domain_compare=False, cat_compare=True)
     monkeypatch.setattr(tuning, 'context', lambda args: (tmp_path, {}))
     calls = []
     def fake_evaluate(args, cfg, candidate, requested=None, stage='full'):
@@ -442,7 +442,8 @@ def test_search_evaluates_one_fixed_catboost_candidate(tmp_path, monkeypatch):
         path = tmp_path / 'candidates' / f"{candidate['name']}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         previous = d.p.read_json(path) if path.exists() else {}
-        score = .6
+        scores = {'cat_fixed': .60, 'cat_regularized': .62, 'cat_deep': .61, 'cat_shallow': .605}
+        score = scores.get(candidate['name'], .5)
         d.p.write_json(path, dict(candidate, stage=stage,
             screen_auc=score if stage == 'screen' else previous.get('screen_auc'),
             screen_fold_auc={'0': score, '1': score} if stage == 'screen' else previous.get('screen_fold_auc'),
@@ -451,10 +452,74 @@ def test_search_evaluates_one_fixed_catboost_candidate(tmp_path, monkeypatch):
         return score
     monkeypatch.setattr(tuning, 'evaluate', fake_evaluate)
     d.search(args)
-    assert [call for call in calls if call[0] == 'cat_fixed'] == [
-        ('cat_fixed', [0, 1], 'screen', 'cuda'),
-        ('cat_fixed', [0, 1, 2, 3], 'full', 'cuda')]
-    assert d.p.read_json(tmp_path / 'promoted.json')['lanes']['cat'] == ['cat_fixed']
+    assert [name for name, folds, stage, device in calls if stage == 'screen'] == [
+        'cat_fixed', 'cat_regularized', 'cat_deep', 'cat_shallow']
+    assert [(name, folds, device) for name, folds, stage, device in calls
+            if stage == 'full' and name.startswith('cat_')] == [
+        ('cat_fixed', [0, 1, 2, 3], 'cuda'),
+        ('cat_regularized', [0, 1, 2, 3], 'cuda')]
+    assert d.p.read_json(tmp_path / 'promoted.json')['lanes']['cat'] == [
+        'cat_fixed', 'cat_regularized']
+
+
+def test_catboost_candidates_keep_fixed_control_and_bounded_search():
+    candidates = d.cat_candidates(4)
+    assert candidates[0] == d.cat_anchor()
+    assert [candidate['name'] for candidate in candidates] == [
+        'cat_fixed', 'cat_regularized', 'cat_deep', 'cat_shallow']
+    assert all(candidate['device'] == 'cuda' and candidate['family'] == 'cat'
+               for candidate in candidates)
+    with pytest.raises(ValueError):
+        d.cat_candidates(5)
+
+
+def test_freeze_accepts_tuned_cat_and_seed_average_only_through_both_gates(tmp_path, monkeypatch):
+    y = np.tile([0, 1], 100)
+    split = d.p.split_plan(y)
+    dev, sealed, _, _ = split
+    d.p.write_json(tmp_path / 'config.json', {'fixture': True})
+    folder = tmp_path / 'candidates'
+    folder.mkdir()
+    for name in ('cat_fixed', 'cat_regularized'):
+        d.p.write_json(folder / f'{name}.json', {'stage': 'full'})
+    d.p.write_json(tmp_path / 'promoted.json', {
+        'lanes': {'cat': ['cat_fixed', 'cat_regularized']}})
+    rng = np.random.default_rng(12)
+    predictions = {
+        'main': np.clip(.5 + .08 * (2 * y - 1) + rng.normal(0, .25, len(y)), .01, .99),
+        'cat_fixed': np.clip(.5 + .12 * (2 * y - 1) + rng.normal(0, .25, len(y)), .01, .99),
+        'cat_regularized': np.clip(.5 + .14 * (2 * y - 1) + rng.normal(0, .25, len(y)), .01, .99),
+        'cat_regularized_seedavg': np.clip(.5 + .16 * (2 * y - 1) + rng.normal(0, .25, len(y)), .01, .99),
+    }
+    for prediction in predictions.values():
+        prediction[sealed] = np.nan
+    records = {
+        'main': dict(d.anchor(), dev_auc=.6),
+        'cat_fixed': dict(d.cat_anchor(), dev_auc=.7),
+        'cat_regularized': dict(d.cat_candidates(2)[1], dev_auc=.71),
+        'cat_regularized_seedavg': dict(d.cat_candidates(2)[1],
+            name='cat_regularized_seedavg', model_seeds=[2026, 42, 3407], dev_auc=.72),
+    }
+    monkeypatch.setattr(freezing, 'context', lambda args:
+        (tmp_path, {'seed': 2026}, None, None, None, None, None, y, split))
+    monkeypatch.setattr(freezing, 'load_candidate', lambda run, name, labels, development, holdout:
+        (records[name], predictions[name]))
+    evaluated = []
+    monkeypatch.setattr(freezing, 'evaluate', lambda args, cfg, candidate, requested, stage:
+        evaluated.append((candidate['name'], candidate['model_seeds'], requested, stage)))
+    def fake_gate(labels, candidate, reference, development, cv):
+        allowed = ((candidate is predictions['cat_regularized'] and reference is predictions['cat_fixed'])
+                   or candidate is predictions['cat_regularized_seedavg'])
+        return dict(allowed=allowed, auc=.72 if allowed else .6, baseline_auc=.7,
+            fold_wins=4 if allowed else 0, fold_auc=[.72] * 4, baseline_fold_auc=[.7] * 4)
+    monkeypatch.setattr(freezing, 'gpu_primary_gate', fake_gate)
+    monkeypatch.setattr(d.p, 'digest', lambda path: 'fixture')
+    d.freeze(Namespace(domain_compare=False, auc_window=.0004, max_corr=1,
+                       final_seeds=[2026, 42, 3407]))
+    assert evaluated == [('cat_regularized_seedavg', [2026, 42, 3407], [0, 1, 2, 3], 'full')]
+    assert d.p.read_json(tmp_path / 'cat_candidate_comparison.json')['chosen'] == 'cat_regularized'
+    assert d.p.read_json(tmp_path / 'cat_seed_average_comparison.json')['accepted'] is True
+    assert 'cat_regularized_seedavg' in d.p.read_json(tmp_path / 'blend_comparison.json')['candidates']
 
 
 def test_freeze_ignores_old_full_candidates_outside_promotion_manifest(tmp_path, monkeypatch):

@@ -36,6 +36,7 @@ def context(args):
         early_stopping=args.early_stopping, auc_window=args.auc_window, max_corr=args.max_corr,
         domain_compare=args.domain_compare, cat_compare=args.cat_compare,
         realmlp_compare=args.realmlp_compare, final_seeds=args.final_seeds,
+        cat_trials=getattr(args, 'cat_trials', 4),
         screen_folds=args.screen_folds, promote_trials=args.promote_trials,
         hashes={f: p.digest(Path(args.data) / f) for f in ('train.csv', 'test.csv', 'sample_submission.csv')},
         sources={path.relative_to(source_root).as_posix(): p.digest(path) for path in source_files},
@@ -79,6 +80,25 @@ def anchor():
 def cat_anchor():
     return dict(name='cat_fixed', lane='cat', family='cat', variant='multiscale_dual',
                 params=p.defaults('cat'), device='cuda')
+
+
+def cat_candidates(count=4):
+    """Small fixed search space keeps CatBoost cost and resume behavior predictable."""
+    base = p.defaults('cat')
+    variants = [
+        ('cat_fixed', {}),
+        ('cat_regularized', dict(learning_rate=.035, l2_leaf_reg=12.,
+                                 random_strength=.5, bagging_temperature=.5)),
+        ('cat_deep', dict(depth=7, learning_rate=.03, l2_leaf_reg=10.,
+                          random_strength=.25, bagging_temperature=1.)),
+        ('cat_shallow', dict(depth=5, learning_rate=.05, l2_leaf_reg=6.,
+                             random_strength=.5, bagging_temperature=2.)),
+    ]
+    if not 1 <= count <= len(variants):
+        raise ValueError(f'CatBoost candidate count must be 1..{len(variants)}')
+    return [dict(name=name, lane='cat', family='cat', variant='multiscale_dual',
+                 params=dict(base, **overrides), device='cuda')
+            for name, overrides in variants[:count]]
 
 
 def domain_anchor():
@@ -497,18 +517,27 @@ def search(args):
         manifest['lanes'][lane] = [f'{lane}_{trial.number}' for trial in promoted]
         p.write_json(manifest_path, manifest)
     if args.cat_compare:
-        candidate = cat_anchor()
-        path = run / 'candidates' / 'cat_fixed.json'
-        if not path.exists():
-            evaluate(args, cfg, candidate, requested=list(range(args.screen_folds)), stage='screen')
-        record = p.read_json(path)
-        if record.get('stage') != 'full':
-            print('Promoting cat_fixed to full 4-fold CV', flush=True)
-            evaluate(args, cfg, candidate, requested=list(range(4)), stage='full')
+        candidates = cat_candidates(getattr(args, 'cat_trials', 4))
+        for candidate in candidates:
+            path = run / 'candidates' / f'{candidate["name"]}.json'
+            if not path.exists():
+                evaluate(args, cfg, candidate, requested=list(range(args.screen_folds)), stage='screen')
+        fixed = candidates[0]
+        challengers = candidates[1:]
+        promoted = [fixed]
+        if challengers:
+            best = max(challengers, key=lambda item:
+                p.read_json(run / 'candidates' / f'{item["name"]}.json')['screen_auc'])
+            promoted.append(best)
+        for candidate in promoted:
+            path = run / 'candidates' / f'{candidate["name"]}.json'
+            if p.read_json(path).get('stage') != 'full':
+                print(f'Promoting {candidate["name"]} to full 4-fold CV', flush=True)
+                evaluate(args, cfg, candidate, requested=list(range(4)), stage='full')
         manifest_path = run / 'promoted.json'
         manifest = p.read_json(manifest_path) if manifest_path.exists() else {
             'screen_folds': args.screen_folds, 'promote_trials': args.promote_trials, 'lanes': {}}
-        manifest['lanes']['cat'] = ['cat_fixed']
+        manifest['lanes']['cat'] = [candidate['name'] for candidate in promoted]
         p.write_json(manifest_path, manifest)
     if getattr(args, 'realmlp_compare', False):
         candidate = realmlp_anchor()

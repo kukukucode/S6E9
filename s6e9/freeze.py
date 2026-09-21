@@ -273,14 +273,62 @@ def freeze(args):
         tie_pool.append(domain)
     manifest_path = run / 'promoted.json'
     manifest = p.read_json(manifest_path) if manifest_path.exists() else {'lanes': {}}
+    cat_names = manifest.get('lanes', {}).get('cat', [])
+    if not cat_names and any((run / 'candidates').glob('cat_*.json')):
+        raise ValueError('Missing promoted.json entry for cat; rerun search before freeze.')
+    if cat_names:
+        invalid = [name for name in cat_names
+                   if not (run / 'candidates' / f'{name}.json').exists()
+                   or p.read_json(run / 'candidates' / f'{name}.json').get('stage') != 'full']
+        if invalid or cat_names[0] != 'cat_fixed' or len(cat_names) > 2:
+            raise ValueError(f'Invalid promoted candidates for cat: {invalid or cat_names}')
+        fixed = load_candidate(run, cat_names[0], y, dev, sealed)
+        chosen = fixed
+        cat_gate = None
+        if len(cat_names) == 2:
+            challenger = load_candidate(run, cat_names[1], y, dev, sealed)
+            cat_gate = gpu_primary_gate(y, challenger[1], fixed[1], dev, cv)
+            if cat_gate['allowed']:
+                chosen = challenger
+        p.write_json(run / 'cat_candidate_comparison.json', dict(
+            fixed=fixed[0]['name'], challenger=None if len(cat_names) == 1 else cat_names[1],
+            chosen=chosen[0]['name'], required_fold_wins=3, gate=cat_gate))
+        redundant = any(np.corrcoef(chosen[1][dev], other[dev])[0, 1] > args.max_corr and
+            np.corrcoef(rankdata(chosen[1][dev]), rankdata(other[dev]))[0, 1] > args.max_corr
+            for _, other in selected)
+        gpu_replacement = gpu_primary_gate(y, chosen[1], baseline[1], dev, cv)['allowed']
+        retained = not redundant or gpu_replacement
+        cat_seed = dict(enabled=False, accepted=False, reason=(
+            'The tuned CatBoost candidate did not pass the fixed-control gate.'
+            if chosen[0]['name'] == 'cat_fixed' else
+            'The tuned CatBoost candidate was redundant with the retained pool.'
+            if not retained else 'Only one seed was requested.'))
+        final_seeds = list(getattr(args, 'final_seeds', [cfg.get('seed', 2026)]))
+        if chosen[0]['name'] != 'cat_fixed' and retained and len(final_seeds) > 1:
+            averaged_candidate = {key: chosen[0][key]
+                for key in ('name', 'lane', 'family', 'variant', 'params', 'device')}
+            averaged_candidate.update(name=chosen[0]['name'] + '_seedavg', model_seeds=final_seeds)
+            evaluate(args, cfg, averaged_candidate, requested=list(range(4)), stage='full')
+            averaged = load_candidate(run, averaged_candidate['name'], y, dev, sealed)
+            seed_gate = gpu_primary_gate(y, averaged[1], chosen[1], dev, cv)
+            cat_seed = dict(enabled=True, accepted=seed_gate['allowed'], seeds=final_seeds,
+                base_candidate=chosen[0]['name'], averaged_candidate=averaged[0]['name'], **seed_gate)
+            if seed_gate['allowed']:
+                chosen = averaged
+        p.write_json(run / 'cat_seed_average_comparison.json', cat_seed)
+        if retained:
+            selected.append(chosen)
+        tie_pool.append(fixed)
+        if chosen[0]['name'] != fixed[0]['name']:
+            tie_pool.append(chosen)
     # Only the latest explicit promotion set can be selected.
-    for lane, limit in [('lgb', 3), ('xgb', 2), ('cat', 1), ('realmlp', 1)]:
+    for lane, limit in [('lgb', 3), ('xgb', 2), ('realmlp', 1)]:
         if not any((run / 'candidates').glob(f'{lane}_*.json')):
             continue
         if lane not in manifest.get('lanes', {}):
             raise ValueError(f'Missing promoted.json entry for {lane}; rerun search before freeze.')
         names = manifest['lanes'][lane]
-        if lane in ('cat', 'realmlp'):
+        if lane == 'realmlp':
             complete = set(names)
         else:
             study = optuna.load_study(study_name=lane,
@@ -320,7 +368,8 @@ def freeze(args):
         chosen_primary=primary[0]['name'], required_fold_wins=3, candidates=gates))
     seed_diagnostic = dict(enabled=False, accepted=False, reason='Primary is not a GPU model or one seed was requested.')
     final_seeds = list(getattr(args, 'final_seeds', [cfg.get('seed', 2026)]))
-    if primary[0].get('device') == 'cuda' and len(final_seeds) > 1:
+    if (primary[0].get('device') == 'cuda' and primary[0].get('family') != 'cat'
+            and len(final_seeds) > 1):
         averaged_candidate = dict(primary[0], name=primary[0]['name'] + '_seedavg',
                                   model_seeds=final_seeds)
         evaluate(args, cfg, averaged_candidate, requested=list(range(4)), stage='full')

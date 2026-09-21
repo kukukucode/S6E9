@@ -19,7 +19,7 @@ from s6e9.freeze import (blend_values, crossfit_blend, fold_tie_statistics, free
                          rank_blend_allowed, rank_columns, rank_oof_matrix,
                          tie_break_allowed, weight_grid, binary_auc, best_blends,
                          crossfit_blends, refine_weights)
-from s6e9.tuning import (anchor, cat_anchor, context, domain_anchor, evaluate, folds,
+from s6e9.tuning import (anchor, cat_anchor, cat_candidates, context, domain_anchor, evaluate, folds,
                          gpu_pool, realmlp_anchor, search, shutdown_gpu_workers,
                          single_seed_folds, suggest, worker, worker_loop)
 
@@ -37,13 +37,15 @@ def main():
     parser.add_argument('--cat-compare', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--realmlp-compare', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--final-seeds', nargs='+', type=int, default=[2026, 42, 3407],
-                        help='Average these seeds only when the selected primary GPU model passes the OOF gate')
+                        help='Average these seeds only when a GPU candidate passes its OOF gate')
     parser.add_argument('--screen-folds', type=int, default=2)
     parser.add_argument('--promote-trials', type=int, default=3)
     parser.add_argument('--max-rounds', type=int, default=3500)
     parser.add_argument('--early-stopping', type=int, default=120)
     parser.add_argument('--lgb-trials', type=int, default=12)
     parser.add_argument('--xgb-trials', type=int, default=6)
+    parser.add_argument('--cat-trials', type=int, default=4,
+                        help='Deterministic CatBoost candidates including the fixed control (1..4)')
     parser.add_argument('--auc-window', type=float, default=.0004)
     parser.add_argument('--max-corr', type=float, default=.999)
     args = parser.parse_args()
@@ -57,6 +59,8 @@ def main():
         return
     if min(args.threads, args.max_rounds, args.early_stopping) < 1 or min(args.lgb_trials, args.xgb_trials) < 0:
         parser.error('Invalid budgets')
+    if not 1 <= args.cat_trials <= 4:
+        parser.error('cat-trials must be 1..4')
     if not 0 < args.max_corr <= 1 or args.auc_window < 0 or args.auc_window > 1:
         parser.error('Invalid candidate filtering thresholds')
     if not 1 <= args.screen_folds <= 4 or args.promote_trials < 1:
