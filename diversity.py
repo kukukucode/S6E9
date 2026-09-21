@@ -18,7 +18,7 @@ from s6e9.freeze import (blend_values, crossfit_blend, fold_tie_statistics, free
                          lexicographic_oof, lexicographic_rank, load_candidate,
                          rank_blend_allowed, rank_columns, rank_oof_matrix,
                          tie_break_allowed, weight_grid, binary_auc, best_blends,
-                         crossfit_blends)
+                         crossfit_blends, refine_weights)
 from s6e9.tuning import (anchor, cat_anchor, context, domain_anchor, evaluate, folds,
                          gpu_pool, realmlp_anchor, search, shutdown_gpu_workers,
                          single_seed_folds, suggest, worker, worker_loop)

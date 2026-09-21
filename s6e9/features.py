@@ -223,8 +223,30 @@ def domain_features(x):
             values['domain_commute_per_station'] = num('Daily_Commute_km') / (1 + total)
     if 'Annual_Income_USD' in x and 'Number_of_Cars_Owned' in x:
         values['domain_income_per_car'] = num('Annual_Income_USD') / (1 + num('Number_of_Cars_Owned'))
+    anxiety = None
     if 'Range_Anxiety_Level' in x:
-        values['domain_anxiety_ordinal'] = x['Range_Anxiety_Level'].map({'Low': 0, 'Medium': 1, 'High': 2})
+        anxiety = x['Range_Anxiety_Level'].astype('string').str.strip().str.lower().map(
+            {'low': 0., 'medium': 1., 'high': 2.})
+        values['domain_anxiety_ordinal'] = anxiety
+    subsidy = None
+    if 'Subsidy_Available' in x:
+        subsidy = x['Subsidy_Available'].astype('string').str.strip().str.lower().map(
+            {'no': 0., 'yes': 1.})
+        values['source_subsidy'] = subsidy
+    concern = num('Environmental_Concern_Level') if 'Environmental_Concern_Level' in x else None
+    income = num('Annual_Income_USD') / 100000 if 'Annual_Income_USD' in x else None
+    if income is not None and subsidy is not None:
+        values['source_income_x_subsidy'] = income * subsidy
+    if concern is not None and subsidy is not None:
+        values['source_concern_x_subsidy'] = concern * subsidy
+    if income is not None and concern is not None:
+        values['source_income_x_concern'] = income * concern
+    if anxiety is not None and subsidy is not None:
+        values['source_anxiety_x_subsidy'] = anxiety * subsidy
+    if all(value is not None for value in (income, concern, subsidy, anxiety)):
+        anxiety_penalty = anxiety.map({0.: 0., 1.: 1., 2.: 3.})
+        values['source_formula_score'] = (1.2 * income + .6 * concern + 2 * subsidy
+                                          - anxiety_penalty)
     return pd.DataFrame(values, index=x.index).replace([np.inf, -np.inf], np.nan)
 
 
@@ -236,8 +258,12 @@ class DomainSignalFeatures(SignalFeatures):
     def keys(self, x):
         keys, numeric = super().keys(x)
         for name, values in domain_features(x).items():
-            keys[name] = Features.tokens(values)
             numeric[name] = values.astype(np.float32)
+            # Continuous source-formula values are useful to trees directly;
+            # their near-unique frequency/TE maps only add memory and noise.
+            if name not in {'source_income_x_subsidy', 'source_income_x_concern',
+                            'source_formula_score'}:
+                keys[name] = Features.tokens(values)
         return keys, numeric
 
 

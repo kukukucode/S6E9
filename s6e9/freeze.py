@@ -100,10 +100,38 @@ def best_blend(y, values, rows, max_secondary):
         candidate_score = binary_auc(y[rows], values[rows] @ candidate)
         if candidate_score > score + 1e-6:
             score, weights = candidate_score, candidate.copy()
+    score, weights = refine_weights(y, values, rows, weights, max_secondary)
     return score, weights
 
 
-def best_blends(y, values, rows):
+def refine_weights(y, values, rows, weights, max_secondary, step=.01, max_steps=8):
+    """Hill-climb on a 1% simplex lattice without an exponential full grid."""
+    weights = np.asarray(weights, dtype=float).copy()
+    score = binary_auc(y[rows], values[rows] @ weights)
+    for _ in range(max_steps):
+        best_score, best_weights = score, weights
+        for donor in range(len(weights)):
+            if weights[donor] < step - 1e-12:
+                continue
+            for receiver in range(len(weights)):
+                if receiver == donor:
+                    continue
+                candidate = weights.copy()
+                candidate[donor] -= step
+                candidate[receiver] += step
+                if 1 - candidate[0] > max_secondary + 1e-12:
+                    continue
+                candidate_score = binary_auc(y[rows], values[rows] @ candidate)
+                if candidate_score > best_score + 1e-6:
+                    best_score, best_weights = candidate_score, candidate
+        if best_score <= score + 1e-6:
+            break
+        score, weights = best_score, best_weights
+    weights[np.abs(weights) < 1e-12] = 0
+    return score, weights
+
+
+def _coarse_blends(y, values, rows):
     """Select the 10% and 30% caps in one pass over the larger grid."""
     first = next(weight_grid(values.shape[1], .30))
     first_score = binary_auc(y[rows], values[rows] @ first)
@@ -117,6 +145,12 @@ def best_blends(y, values, rows):
         if candidate_score > wide_score + 1e-6:
             wide_score, wide_weights = candidate_score, candidate.copy()
     return (narrow_score, narrow_weights), (wide_score, wide_weights)
+
+
+def best_blends(y, values, rows):
+    narrow, wide = _coarse_blends(y, values, rows)
+    return (refine_weights(y, values, rows, narrow[1], .10),
+            refine_weights(y, values, rows, wide[1], .30))
 
 
 def crossfit_blend(y, values, cv, max_secondary):
@@ -135,13 +169,18 @@ def crossfit_blend(y, values, cv, max_secondary):
 
 
 def crossfit_blends(y, values, cv):
-    predictions = {'narrow': np.full(len(y), np.nan), 'wide': np.full(len(y), np.nan)}
-    weights = {'narrow': [], 'wide': []}
+    names = ('coarse_narrow', 'coarse_wide', 'narrow', 'wide')
+    predictions = {name: np.full(len(y), np.nan) for name in names}
+    weights = {name: [] for name in names}
     for fold, (_, iv) in enumerate(cv):
         training = np.concatenate([other_iv for other_fold, (_, other_iv) in enumerate(cv)
                                    if other_fold != fold])
-        narrow, wide = best_blends(y, values, training)
-        for name, (_, selected) in [('narrow', narrow), ('wide', wide)]:
+        coarse_narrow, coarse_wide = _coarse_blends(y, values, training)
+        narrow = refine_weights(y, values, training, coarse_narrow[1], .10)
+        wide = refine_weights(y, values, training, coarse_wide[1], .30)
+        choices = [('coarse_narrow', coarse_narrow), ('coarse_wide', coarse_wide),
+                   ('narrow', narrow), ('wide', wide)]
+        for name, (_, selected) in choices:
             predictions[name][iv] = values[iv] @ selected
             weights[name].append(selected.tolist())
     development = np.concatenate([iv for _, iv in cv])
@@ -299,16 +338,28 @@ def freeze(args):
     best = {}
     for mode, values in [('probability', matrix), ('rank', rank_matrix)]:
         crossfit = crossfit_blends(y, values, cv)
-        narrow_cv, wide_cv = crossfit['narrow'], crossfit['wide']
+        narrow_refined, narrow_refine_wins = improvement_gate(
+            crossfit['coarse_narrow'], crossfit['narrow'])
+        wide_refined, wide_refine_wins = improvement_gate(
+            crossfit['coarse_wide'], crossfit['wide'])
+        narrow_cv = crossfit['narrow'] if narrow_refined else crossfit['coarse_narrow']
+        wide_cv = crossfit['wide'] if wide_refined else crossfit['coarse_wide']
         wide_allowed, wide_wins = improvement_gate(narrow_cv, wide_cv)
         cap = .30 if wide_allowed else .10
-        score, weights = best_blend(y, values, dev, cap)
+        refine = wide_refined if wide_allowed else narrow_refined
+        if refine:
+            score, weights = best_blend(y, values, dev, cap)
+        else:
+            chosen = _coarse_blends(y, values, dev)[1 if wide_allowed else 0]
+            score, weights = chosen
         winner = dict(auc=score, weights=weights,
             fold_auc=fold_auc_scores(y, values @ weights, cv), cap=cap,
             crossfit_auc=(wide_cv if wide_allowed else narrow_cv)['auc'],
             crossfit_fold_auc=(wide_cv if wide_allowed else narrow_cv)['fold_auc'],
             crossfit_fold_weights=(wide_cv if wide_allowed else narrow_cv)['fold_weights'],
             wide_allowed=wide_allowed, wide_fold_wins=wide_wins,
+            one_percent_refinement=refine,
+            one_percent_fold_wins=wide_refine_wins if wide_allowed else narrow_refine_wins,
             narrow_crossfit_auc=narrow_cv['auc'], narrow_crossfit_fold_auc=narrow_cv['fold_auc'],
             wide_crossfit_auc=wide_cv['auc'], wide_crossfit_fold_auc=wide_cv['fold_auc'])
         best[mode] = winner
@@ -347,6 +398,8 @@ def freeze(args):
                          crossfit_fold_weights=best['probability']['crossfit_fold_weights'],
                          wide_allowed=best['probability']['wide_allowed'],
                          wide_fold_wins=best['probability']['wide_fold_wins'],
+                         one_percent_refinement=best['probability']['one_percent_refinement'],
+                         one_percent_fold_wins=best['probability']['one_percent_fold_wins'],
                          narrow_crossfit_auc=best['probability']['narrow_crossfit_auc'],
                          wide_crossfit_auc=best['probability']['wide_crossfit_auc']),
         rank=dict(auc=best['rank']['auc'], weights=best['rank']['weights'].tolist(),
@@ -356,6 +409,8 @@ def freeze(args):
                   crossfit_fold_weights=best['rank']['crossfit_fold_weights'],
                   wide_allowed=best['rank']['wide_allowed'],
                   wide_fold_wins=best['rank']['wide_fold_wins'],
+                  one_percent_refinement=best['rank']['one_percent_refinement'],
+                  one_percent_fold_wins=best['rank']['one_percent_fold_wins'],
                   narrow_crossfit_auc=best['rank']['narrow_crossfit_auc'],
                   wide_crossfit_auc=best['rank']['wide_crossfit_auc']),
         rank_fold_wins=rank_wins, rank_required_fold_wins=3, chosen_mode=mode))
