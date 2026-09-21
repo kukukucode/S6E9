@@ -193,7 +193,8 @@ def test_xgb_cuda_worker_validates_serialized_backend(tmp_path, monkeypatch):
     monkeypatch.setattr(d.p, 'predict', lambda model, x, family: np.full(len(x), .5))
     d.worker(job_path)
     assert backends[0]['xgb_device'] == 'cuda:0'
-    assert d.checked_prediction(output).shape[0] > 0
+    prediction, metadata = d.checked_prediction(output)
+    assert prediction.shape[0] > 0 and metadata['device'] == 'cuda'
 
 
 @pytest.mark.parametrize('visible, expected', [
