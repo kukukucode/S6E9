@@ -46,6 +46,9 @@ class NotebookDataTests(unittest.TestCase):
         scope = {}
         exec(compile(ast.Module(body=definitions, type_ignores=[]), '<notebook-data-cell>', 'exec'), scope)
         cls.find = staticmethod(scope['find_s6e9_data'])
+        cls.restore = staticmethod(scope['restore_previous_run'])
+        cls.migrate = staticmethod(scope['migrate_restored_run'])
+        cls.digest = staticmethod(scope['_artifact_digest'])
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -106,6 +109,60 @@ class NotebookDataTests(unittest.TestCase):
     def test_missing_input_root(self):
         with self.assertRaisesRegex(FileNotFoundError, 'Add Input'):
             self.find(self.root / 'not-mounted')
+
+    def test_unique_frozen_output_is_restored_for_resume(self):
+        source = self.root / 'notebook-output' / 's6e9_diversity_v6_0'
+        source.mkdir(parents=True)
+        (source / 'config.json').write_text('{}')
+        (source / 'frozen.json').write_text('{}')
+        (source / 'cached.npy').write_bytes(b'prediction')
+        destination = self.root / 'working' / source.name
+        self.assertEqual(self.restore(destination, self.root), source)
+        self.assertEqual((destination / 'cached.npy').read_bytes(), b'prediction')
+
+    def test_resume_requires_one_valid_frozen_output(self):
+        for owner in ('first', 'second'):
+            source = self.root / owner / 's6e9_diversity_v6_0'
+            source.mkdir(parents=True)
+            (source / 'config.json').write_text('{}')
+            (source / 'frozen.json').write_text('{}')
+        destination = self.root / 'working' / 's6e9_diversity_v6_0'
+        with self.assertRaisesRegex(ValueError, 'Multiple resumable runs'):
+            self.restore(destination, self.root)
+
+    def test_restored_run_migrates_only_the_audit_import_fix(self):
+        source_root = self.root / 'working'
+        audit = source_root / 's6e9' / 'audit.py'
+        audit.parent.mkdir(parents=True)
+        audit.write_text('import numpy as np\n')
+        run = source_root / 's6e9_diversity_v6_0'
+        run.mkdir()
+        config = run / 'config.json'
+        config.write_text(json.dumps({'gpu_ids': ['old-a', 'old-b'],
+                                      'sources': {'s6e9/audit.py': 'old'}}))
+        frozen = run / 'frozen.json'
+        frozen.write_text(json.dumps({'config_sha256': self.digest(config), 'weights': [1.0]}))
+        marker = run / 'SEALED_OPENED.json'
+        marker.write_text(json.dumps({'frozen_sha256': self.digest(frozen)}))
+        self.assertTrue(self.migrate(run, ['new-a', 'new-b'], source_root))
+        migrated = json.loads(config.read_text())
+        self.assertEqual(migrated['sources']['s6e9/audit.py'], self.digest(audit))
+        self.assertEqual(migrated['gpu_ids'], ['new-a', 'new-b'])
+        self.assertEqual(json.loads(frozen.read_text())['config_sha256'], self.digest(config))
+        self.assertEqual(json.loads(marker.read_text())['frozen_sha256'], self.digest(frozen))
+        self.assertTrue((run / 'resume_migration.json').is_file())
+
+    def test_restored_run_rejects_training_code_changes(self):
+        source_root = self.root / 'working'
+        tuning = source_root / 's6e9' / 'tuning.py'
+        tuning.parent.mkdir(parents=True)
+        tuning.write_text('changed training code\n')
+        run = source_root / 's6e9_diversity_v6_0'
+        run.mkdir()
+        (run / 'config.json').write_text(json.dumps({'sources': {'s6e9/tuning.py': 'old'}}))
+        (run / 'frozen.json').write_text('{}')
+        with self.assertRaisesRegex(ValueError, 'Unsafe resume'):
+            self.migrate(run, ['new-a', 'new-b'], source_root)
 
 
 class NotebookSubmissionTests(unittest.TestCase):
