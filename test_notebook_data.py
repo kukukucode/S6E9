@@ -7,32 +7,106 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import build_stage_notebooks
+
+
+NOTEBOOKS = ('S6E9_Prototype.ipynb', '01_search.ipynb',
+             '02_freeze.ipynb', '03_finalize.ipynb')
+
 
 class NotebookPackageTests(unittest.TestCase):
     def test_embedded_package_matches_repository_sources(self):
         root = Path(__file__).parent
-        notebook = json.loads((root / 'S6E9_Prototype.ipynb').read_text(encoding='utf-8'))
-        source = next(''.join(cell['source']) for cell in notebook['cells']
-                      if cell['cell_type'] == 'code' and "PACKAGE = Path('/kaggle/working/s6e9')" in ''.join(cell['source']))
-        assignments = {}
-        for node in ast.parse(source).body:
-            if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
-                continue
-            function = node.value.func
-            if not isinstance(function, ast.Attribute) or function.attr != 'write_text':
-                continue
-            target = function.value
-            if isinstance(target, ast.Name):
-                assignments[target.id] = ast.literal_eval(node.value.args[0])
-            elif isinstance(target, ast.BinOp) and isinstance(target.op, ast.Div):
-                assignments['s6e9/' + ast.literal_eval(target.right)] = ast.literal_eval(node.value.args[0])
         expected = {'SCRIPT': 'prototype.py', 'GPU_SETUP': 'gpu_setup.py',
                     'DIVERSITY_SCRIPT': 'diversity.py'}
         expected.update({f's6e9/{path.name}': str(path.relative_to(root)).replace('\\', '/')
                          for path in (root / 's6e9').glob('*.py')})
-        self.assertEqual(set(assignments), set(expected))
-        for key, filename in expected.items():
-            self.assertEqual(assignments[key], (root / filename).read_text(encoding='utf-8'))
+        for filename in NOTEBOOKS:
+            with self.subTest(notebook=filename):
+                notebook = json.loads((root / filename).read_text(encoding='utf-8'))
+                source = next(''.join(cell['source']) for cell in notebook['cells']
+                    if cell['cell_type'] == 'code'
+                    and "PACKAGE = Path('/kaggle/working/s6e9')" in ''.join(cell['source']))
+                assignments = {}
+                for node in ast.parse(source).body:
+                    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+                        continue
+                    function = node.value.func
+                    if not isinstance(function, ast.Attribute) or function.attr != 'write_text':
+                        continue
+                    target = function.value
+                    if isinstance(target, ast.Name):
+                        assignments[target.id] = ast.literal_eval(node.value.args[0])
+                    elif isinstance(target, ast.BinOp) and isinstance(target.op, ast.Div):
+                        assignments['s6e9/' + ast.literal_eval(target.right)] = ast.literal_eval(node.value.args[0])
+                self.assertEqual(set(assignments), set(expected))
+                for key, source_filename in expected.items():
+                    self.assertEqual(assignments[key],
+                                     (root / source_filename).read_text(encoding='utf-8'))
+
+    def test_staged_notebooks_are_generated_from_current_source(self):
+        for filename, expected in build_stage_notebooks.generate().items():
+            with self.subTest(notebook=filename):
+                self.assertEqual((Path(__file__).parent / filename).read_text(encoding='utf-8'), expected)
+
+
+class NotebookStageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).parent
+        notebook = json.loads((root / '02_freeze.ipynb').read_text(encoding='utf-8'))
+        source = next(''.join(cell['source']) for cell in notebook['cells']
+                      if cell['cell_type'] == 'code' and 'def restore_run(' in ''.join(cell['source']))
+        function = next(node for node in ast.parse(source).body
+                        if isinstance(node, ast.FunctionDef) and node.name == 'restore_run')
+        cls.function = function
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.inputs = self.root / 'input'
+        self.inputs.mkdir()
+        self.run = self.root / 'working' / 's6e9_fast_v6_2'
+        scope = {'Path': Path, 'shutil': shutil, 'RUN': self.run}
+        exec(compile(ast.Module(body=[self.function], type_ignores=[]),
+                     '<notebook-restore-cell>', 'exec'), scope)
+        self.restore = scope['restore_run']
+
+    def test_previous_output_is_copied_to_writable_run(self):
+        prior = self.inputs / 'previous-output' / self.run.name
+        prior.mkdir(parents=True)
+        (prior / 'promoted.json').write_text('{}')
+        (prior / 'cache').mkdir()
+        (prior / 'cache' / 'prediction.npy').write_bytes(b'cached')
+        self.assertEqual(self.restore('promoted.json', self.inputs), self.run)
+        self.assertEqual((self.run / 'cache' / 'prediction.npy').read_bytes(), b'cached')
+        (self.run / 'writable.txt').write_text('ok')
+
+    def test_missing_or_ambiguous_previous_output_stops(self):
+        with self.assertRaisesRegex(FileNotFoundError, 'previous-stage Notebook Output'):
+            self.restore('promoted.json', self.inputs)
+        for owner in ('first', 'second'):
+            prior = self.inputs / owner / self.run.name
+            prior.mkdir(parents=True)
+            (prior / 'promoted.json').write_text('{}')
+        with self.assertRaisesRegex(FileNotFoundError, 'exactly one'):
+            self.restore('promoted.json', self.inputs)
+
+    def test_each_stage_runs_only_its_declared_commands(self):
+        root = Path(__file__).parent
+        expected = {
+            '01_search.ipynb': ["execute('search')"],
+            '02_freeze.ipynb': ["execute('freeze')"],
+            '03_finalize.ipynb': ["execute('audit')", "execute('finalize')"],
+        }
+        for filename, commands in expected.items():
+            notebook = json.loads((root / filename).read_text(encoding='utf-8'))
+            source = '\n'.join(''.join(cell['source']) for cell in notebook['cells'])
+            found = [command for command in ("execute('search')", "execute('freeze')",
+                                              "execute('audit')", "execute('finalize')")
+                     if command in source]
+            self.assertEqual(found, commands)
 
 
 class NotebookDataTests(unittest.TestCase):

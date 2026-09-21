@@ -1,6 +1,6 @@
 # S6E9
 
-Kaggleで `S6E9_Prototype.ipynb` をImportし、コンペデータ・Internet・`GPU T4 x2`を有効にしてRun Allします。選択済み構成は `/kaggle/working/submission.csv`、同じ予測のprobability/rank版は `submission_probability.csv` と `submission_rank.csv` に生成されます。GPUや入力が違う場合は学習前に停止します。
+Kaggleで `01_search.ipynb` → `02_freeze.ipynb` → `03_finalize.ipynb` の順に実行し、各Save VersionのOutputを次のNotebookのInputに追加します。コンペデータ・Internet・`GPU T4 x2`が必要です。最後に3種類の提出CSVが `/kaggle/working` に生成されます。`S6E9_Prototype.ipynb` は一括実行版です。
 
 Notebookの先頭で `s6e9/` packageを `/kaggle/working` に展開します。実装は `data / split / features / models / tuning / freeze / audit / finalize / artifact` に分割し、`prototype.py` と `diversity.py` は互換CLIとして残しています。
 
