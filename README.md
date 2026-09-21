@@ -4,7 +4,7 @@ Kaggleで `S6E9_Prototype.ipynb` をImportし、コンペデータ・Internet・
 
 Notebookの先頭で `s6e9/` packageを `/kaggle/working` に展開します。実装は `data / split / features / models / tuning / freeze / audit / finalize / artifact` に分割し、`prototype.py` と `diversity.py` は互換CLIとして残しています。
 
-LightGBM 12 trials、XGBoost 6 trials、固定CatBoost候補を評価し、生成式由来の相互作用をdomain候補で比較します。1%刻みblendは粗い重みよりdevelopment OOF全体と4-fold中3-fold以上で改善した場合だけ使います。RealMLPは実測で遅く精度も低かったため既定工程から外しています。
+LightGBM 12 trials、XGBoost 6 trials、CatBoost 4候補を評価します。CatBoostは2-foldで選別し、固定候補よりdevelopment OOF全体と4-fold中3-fold以上で改善した候補だけを採用・seed平均します。1%刻みblendにも同じ改善条件を使います。RealMLPは既定工程から外しています。
 
 CIはUbuntu・Python 3.12で構文チェックと全pytestを実行します。GPU実機はCIに含めず、GPU割り当てはモックテストで確認します。
 
