@@ -8,3 +8,4 @@ catboost==1.2.10
 optuna==5.0.0
 pytabkit==1.7.3
 pytest==9.1.1
+ruff==0.16.8
