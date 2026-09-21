@@ -31,6 +31,21 @@ def test_wide_blend_remains_bounded_and_crossfit_gate_needs_three_wins():
     assert not accepted and wins == 2
 
 
+def test_fast_auc_and_combined_grid_match_reference_paths():
+    rng = np.random.default_rng(19)
+    y = np.tile([0, 1], 100)
+    values = np.round(rng.uniform(.05, .95, (len(y), 4)), 2)
+    rows = np.arange(len(y))
+    assert d.binary_auc(y, values[:, 0]) == pytest.approx(d.roc_auc_score(y, values[:, 0]), abs=1e-15)
+    narrow, wide = d.best_blends(y, values, rows)
+    reference_narrow = freezing.best_blend(y, values, rows, .10)
+    reference_wide = freezing.best_blend(y, values, rows, .30)
+    assert narrow[0] == pytest.approx(reference_narrow[0], abs=1e-15)
+    assert wide[0] == pytest.approx(reference_wide[0], abs=1e-15)
+    np.testing.assert_array_equal(narrow[1], reference_narrow[1])
+    np.testing.assert_array_equal(wide[1], reference_wide[1])
+
+
 def test_seed_ensemble_averages_cached_member_predictions(monkeypatch):
     calls = []
     def fake(args, cfg, candidate, phase, requested):

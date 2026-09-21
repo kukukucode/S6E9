@@ -17,7 +17,8 @@ from s6e9.freeze import (blend_values, crossfit_blend, fold_tie_statistics, free
                          frozen_config, gpu_primary_gate, improvement_gate,
                          lexicographic_oof, lexicographic_rank, load_candidate,
                          rank_blend_allowed, rank_columns, rank_oof_matrix,
-                         tie_break_allowed, weight_grid)
+                         tie_break_allowed, weight_grid, binary_auc, best_blends,
+                         crossfit_blends)
 from s6e9.tuning import (anchor, cat_anchor, context, domain_anchor, evaluate, folds,
                          gpu_pool, realmlp_anchor, search, shutdown_gpu_workers,
                          single_seed_folds, suggest, worker, worker_loop)
@@ -34,7 +35,7 @@ def main():
     parser.add_argument('--gpu-ids', nargs='+', default=None, help='Two physical T4 IDs/UUIDs; default auto-detect')
     parser.add_argument('--domain-compare', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--cat-compare', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--realmlp-compare', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--realmlp-compare', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--final-seeds', nargs='+', type=int, default=[2026, 42, 3407],
                         help='Average these seeds only when the selected primary GPU model passes the OOF gate')
     parser.add_argument('--screen-folds', type=int, default=2)

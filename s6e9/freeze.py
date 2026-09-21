@@ -69,17 +69,54 @@ def blend_values(matrix, weights, mode):
 
 
 def fold_auc_scores(y, prediction, cv):
-    return [float(roc_auc_score(y[iv], prediction[iv])) for _, iv in cv]
+    return [binary_auc(y[iv], prediction[iv]) for _, iv in cv]
+
+
+def binary_auc(y, prediction):
+    """Exact binary ROC-AUC with much less per-call validation overhead."""
+    y = np.asarray(y)
+    prediction = np.asarray(prediction, dtype=float)
+    if y.ndim != 1 or prediction.shape != y.shape or not np.isfinite(prediction).all():
+        raise ValueError('AUC inputs must be aligned finite vectors')
+    positives = int(np.count_nonzero(y == 1))
+    negatives = int(np.count_nonzero(y == 0))
+    if positives + negatives != len(y) or not positives or not negatives:
+        raise ValueError('AUC labels must contain both binary classes')
+    order = np.argsort(prediction, kind='quicksort')
+    ordered_prediction = prediction[order]
+    ordered_y = y[order]
+    starts = np.r_[0, 1 + np.flatnonzero(ordered_prediction[1:] != ordered_prediction[:-1])]
+    ends = np.r_[starts[1:], len(y)]
+    positive_counts = np.add.reduceat(ordered_y, starts)
+    positive_rank_sum = np.sum(positive_counts * ((starts + 1 + ends) * .5))
+    return float((positive_rank_sum - positives * (positives + 1) * .5) /
+                 (positives * negatives))
 
 
 def best_blend(y, values, rows, max_secondary):
     weights = next(weight_grid(values.shape[1], max_secondary))
-    score = float(roc_auc_score(y[rows], values[rows] @ weights))
+    score = binary_auc(y[rows], values[rows] @ weights)
     for candidate in weight_grid(values.shape[1], max_secondary):
-        candidate_score = float(roc_auc_score(y[rows], values[rows] @ candidate))
+        candidate_score = binary_auc(y[rows], values[rows] @ candidate)
         if candidate_score > score + 1e-6:
             score, weights = candidate_score, candidate.copy()
     return score, weights
+
+
+def best_blends(y, values, rows):
+    """Select the 10% and 30% caps in one pass over the larger grid."""
+    first = next(weight_grid(values.shape[1], .30))
+    first_score = binary_auc(y[rows], values[rows] @ first)
+    narrow_score, narrow_weights = first_score, first.copy()
+    wide_score, wide_weights = first_score, first.copy()
+    for candidate in weight_grid(values.shape[1], .30):
+        candidate_score = binary_auc(y[rows], values[rows] @ candidate)
+        secondary = 1 - candidate[0]
+        if secondary <= .10 + 1e-12 and candidate_score > narrow_score + 1e-6:
+            narrow_score, narrow_weights = candidate_score, candidate.copy()
+        if candidate_score > wide_score + 1e-6:
+            wide_score, wide_weights = candidate_score, candidate.copy()
+    return (narrow_score, narrow_weights), (wide_score, wide_weights)
 
 
 def crossfit_blend(y, values, cv, max_secondary):
@@ -95,6 +132,22 @@ def crossfit_blend(y, values, cv, max_secondary):
     return dict(auc=float(roc_auc_score(y[development], prediction[development])),
                 fold_auc=fold_auc_scores(y, prediction, cv), fold_weights=weights,
                 prediction=prediction)
+
+
+def crossfit_blends(y, values, cv):
+    predictions = {'narrow': np.full(len(y), np.nan), 'wide': np.full(len(y), np.nan)}
+    weights = {'narrow': [], 'wide': []}
+    for fold, (_, iv) in enumerate(cv):
+        training = np.concatenate([other_iv for other_fold, (_, other_iv) in enumerate(cv)
+                                   if other_fold != fold])
+        narrow, wide = best_blends(y, values, training)
+        for name, (_, selected) in [('narrow', narrow), ('wide', wide)]:
+            predictions[name][iv] = values[iv] @ selected
+            weights[name].append(selected.tolist())
+    development = np.concatenate([iv for _, iv in cv])
+    return {name: dict(auc=binary_auc(y[development], prediction[development]),
+        fold_auc=fold_auc_scores(y, prediction, cv), fold_weights=weights[name],
+        prediction=prediction) for name, prediction in predictions.items()}
 
 
 def improvement_gate(base, candidate):
@@ -245,8 +298,8 @@ def freeze(args):
     rank_matrix = rank_oof_matrix(matrix, cv)
     best = {}
     for mode, values in [('probability', matrix), ('rank', rank_matrix)]:
-        narrow_cv = crossfit_blend(y, values, cv, .10)
-        wide_cv = crossfit_blend(y, values, cv, .30)
+        crossfit = crossfit_blends(y, values, cv)
+        narrow_cv, wide_cv = crossfit['narrow'], crossfit['wide']
         wide_allowed, wide_wins = improvement_gate(narrow_cv, wide_cv)
         cap = .30 if wide_allowed else .10
         score, weights = best_blend(y, values, dev, cap)
