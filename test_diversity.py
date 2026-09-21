@@ -160,6 +160,43 @@ def test_features_reused_across_model_families_but_not_seeds(tmp_path, monkeypat
         d.checked_prediction(path)
 
 
+def test_xgb_cuda_worker_validates_serialized_backend(tmp_path, monkeypatch):
+    y = np.tile([0, 1], 50)
+    train = pd.DataFrame({'feature': np.arange(len(y)), d.p.TARGET: y})
+    test = pd.DataFrame({'feature': [101, 102]})
+    cache = tmp_path / 'data.joblib'
+    d.joblib.dump((train, test, None, ['feature'], y, d.p.split_plan(y)), cache, compress=0)
+    config = dict(seed=2026, hashes={'data': 'fixture'}, sources={'code': 'fixture'},
+                  versions={'xgboost': 'fixture'}, max_rounds=3, early_stopping=1,
+                  _data_cache=str(cache))
+    output = tmp_path / 'prediction.npy'
+    job = dict(config=config, candidate=dict(name='xgb_gpu', family='xgb', variant='raw',
+        params={}, device='cuda'), run=str(tmp_path), phase='dev', folds=[0], threads=1,
+        outputs={'0': str(output)})
+    job_path = tmp_path / 'job.json'
+    d.p.write_json(job_path, job)
+    class Features:
+        def fit_transform(self, x, labels):
+            return x
+        def transform(self, x):
+            return x
+    class Booster:
+        def save_config(self):
+            return '{"learner":{"generic_param":{"device":"cuda:0"}}}'
+    class Model:
+        def get_booster(self):
+            return Booster()
+    backends = []
+    monkeypatch.setattr(d.p, 'make_features', lambda variant, seed: Features())
+    monkeypatch.setattr(d.p, 'fit_model', lambda family, params, x, labels, valid, seed, backend, rounds:
+                        (backends.append(backend) or Model(), 3))
+    monkeypatch.setattr(d.p, 'predict', lambda model, x, family: np.full(len(x), .5))
+    d.worker(job_path)
+    assert backends[0]['xgb_device'] == 'cuda:0'
+    prediction, metadata = d.checked_prediction(output)
+    assert prediction.shape[0] > 0 and metadata['device'] == 'cuda'
+
+
 @pytest.mark.parametrize('visible, expected', [
     ('2,1', ['2', '1']), ('0,2,-1,1', ['0', '2']),
     ('GPU-aaa,GPU-bbb', ['GPU-aaa', 'GPU-bbb']),
