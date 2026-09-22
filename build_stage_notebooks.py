@@ -75,9 +75,49 @@ def generate():
             deepcopy(cells["s6e9-cell-12"]), deepcopy(cells["s6e9-cell-13"]),
         ],
     }
+    ensemble_source = (ROOT / "ensemble.py").read_text(encoding="utf-8")
+    ensemble_metadata = deepcopy(source["metadata"])
+    ensemble_metadata["kaggle"]["accelerator"] = "none"
+    ensemble_metadata["kaggle"]["isGpuEnabled"] = False
+    ensemble_metadata["kaggle"]["isInternetEnabled"] = False
+    stages["04_ensemble.ipynb"] = [
+        markdown("s6e9-ensemble-title", "# S6E9: OOF ensemble\n\n複数の03_finalize OutputをCPUでcross-fit比較します。\n"),
+        code("s6e9-ensemble-imports", '''from pathlib import Path
+import importlib.util
+import json
+import subprocess
+import sys
+
+required = ['numpy', 'pandas', 'scipy', 'sklearn']
+missing = [name for name in required if importlib.util.find_spec(name) is None]
+assert not missing, f'Missing libraries: {missing}'
+INPUT_ROOT = Path('/kaggle/input')
+OUTPUT = Path('/kaggle/working/s6e9_ensemble_v1')
+MIN_FOLD_WINS = 4
+print('Inputs:', INPUT_ROOT, 'Output:', OUTPUT)
+'''),
+        code("s6e9-ensemble-script",
+             "ENSEMBLE_SCRIPT = Path('/kaggle/working/ensemble.py')\n"
+             f"ENSEMBLE_SCRIPT.write_text({ensemble_source!r}, encoding='utf-8')\n"),
+        code("s6e9-ensemble-run", '''subprocess.run([sys.executable, '-u', str(ENSEMBLE_SCRIPT),
+    '--input-root', str(INPUT_ROOT), '--output', str(OUTPUT),
+    '--min-fold-wins', str(MIN_FOLD_WINS)], check=True)
+'''),
+        code("s6e9-ensemble-result", '''from IPython.display import FileLink, display
+
+report = json.loads((OUTPUT / 'ensemble_report.json').read_text(encoding='utf-8'))
+print(json.dumps(report, indent=2, ensure_ascii=False))
+submission = OUTPUT / 'submission_ensemble.csv'
+if report['accepted']:
+    display(FileLink(str(submission)))
+else:
+    print('Cross-fit gate未通過のため、提出CSVは生成していません。')
+'''),
+    ]
     result = {}
     for filename, stage_cells in stages.items():
-        notebook = {"metadata": deepcopy(source["metadata"]),
+        metadata = ensemble_metadata if filename == "04_ensemble.ipynb" else deepcopy(source["metadata"])
+        notebook = {"metadata": metadata,
                     "nbformat_minor": source["nbformat_minor"],
                     "nbformat": source["nbformat"], "cells": stage_cells}
         result[filename] = json.dumps(notebook, ensure_ascii=False,

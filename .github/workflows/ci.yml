@@ -31,10 +31,12 @@ jobs:
             s6e9 \
             prototype.py \
             diversity.py \
-            gpu_setup.py
+            gpu_setup.py \
+            ensemble.py \
+            build_stage_notebooks.py
 
       - name: Check undefined names
-        run: ruff check --select F821 s6e9 prototype.py diversity.py gpu_setup.py
+        run: ruff check --select F821 s6e9 prototype.py diversity.py gpu_setup.py ensemble.py build_stage_notebooks.py
 
       - name: Run tests
         run: python -m pytest -q
