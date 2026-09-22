@@ -109,6 +109,30 @@ class NotebookStageTests(unittest.TestCase):
             self.assertEqual(found, commands)
 
 
+class EnsembleNotebookTests(unittest.TestCase):
+    def test_embedded_ensemble_matches_source_and_disables_gpu(self):
+        root = Path(__file__).parent
+        notebook = json.loads((root / '04_ensemble.ipynb').read_text(encoding='utf-8'))
+        self.assertFalse(notebook['metadata']['kaggle']['isGpuEnabled'])
+        self.assertFalse(notebook['metadata']['kaggle']['isInternetEnabled'])
+        source = next(''.join(cell['source']) for cell in notebook['cells']
+                      if cell['cell_type'] == 'code' and 'ENSEMBLE_SCRIPT.write_text(' in ''.join(cell['source']))
+        assignment = next(node for node in ast.parse(source).body
+                          if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                          and isinstance(node.value.func, ast.Attribute)
+                          and node.value.func.attr == 'write_text')
+        self.assertEqual(ast.literal_eval(assignment.value.args[0]),
+                         (root / 'ensemble.py').read_text(encoding='utf-8'))
+
+    def test_ensemble_notebook_uses_outputs_without_training_commands(self):
+        notebook = json.loads(Path(__file__).with_name('04_ensemble.ipynb').read_text(encoding='utf-8'))
+        source = '\n'.join(''.join(cell['source']) for cell in notebook['cells'])
+        self.assertIn('--input-root', source)
+        self.assertIn('MIN_FOLD_WINS = 4', source)
+        self.assertNotIn("execute('search')", source)
+        self.assertNotIn("execute('finalize')", source)
+
+
 class NotebookDataTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
